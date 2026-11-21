@@ -1,0 +1,19 @@
+[package]
+name = "satella-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A terminal harness for the Satella engine."
+
+[dependencies]
+satella-core.workspace = true
+satella-runtime.workspace = true
+satella-localsend.workspace = true
+satella-quickshare.workspace = true
+satella-mta.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/satella-core",
+    "crates/satella-runtime",
+    "crates/satella-localsend",
+    "crates/satella-quickshare",
+    "crates/satella-mta",
+    "crates/satella-api",
+    "crates/satella-cli",
+]
+
+# The vendored upstream engines keep their own warnings: they are forks, and
+# patching them away would only add noise to the diff against upstream.
+exclude = [
+    "crates/satella-localsend/vendor/localsend-core",
+    "crates/satella-quickshare/vendor/rqs-core",
+    "crates/satella-mta/vendor/mta-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/satella/satella"
+authors = ["Satella Contributors"]
+
+[workspace.dependencies]
+satella-core = { path = "crates/satella-core" }
+satella-runtime = { path = "crates/satella-runtime" }
+satella-localsend = { path = "crates/satella-localsend" }
+satella-quickshare = { path = "crates/satella-quickshare" }
+satella-mta = { path = "crates/satella-mta" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time", "io-util", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.dev]
+debug = "line-tables-only"

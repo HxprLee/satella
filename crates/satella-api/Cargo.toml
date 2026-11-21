@@ -1,0 +1,28 @@
+[package]
+name = "satella-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The UniFFI surface of Satella."
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "satella"
+path = "src/lib.rs"
+
+[dependencies]
+satella-core.workspace = true
+satella-runtime.workspace = true
+satella-localsend.workspace = true
+satella-quickshare.workspace = true
+satella-mta.workspace = true
+
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+uniffi = "0.32"
+
+[build-dependencies]
+uniffi = { version = "0.32", features = ["build"] }

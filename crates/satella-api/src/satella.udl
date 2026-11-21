@@ -1,0 +1,128 @@
+[Error]
+interface SatellaError {
+  UnknownProtocol(string message);
+  Adapter(string message);
+  Startup(string message);
+};
+
+/// The protocol a peer speaks.
+enum Protocol {
+    "LocalSend",
+    "QuickShare",
+    "Mta",
+};
+
+/// A device discovered on the network.
+dictionary Peer {
+    /// The protocol the peer speaks.
+    Protocol protocol;
+    /// The display name of the peer.
+    string alias;
+    /// The fingerprint identifying the peer.
+    string fingerprint;
+    /// The device model, when the protocol reports one.
+    string? device_model;
+    /// The device type, when the protocol reports one.
+    string? device_type;
+    /// The protocol version the peer implements.
+    string? version;
+    /// The address the peer was seen at.
+    string? address;
+};
+
+/// A file offered by a sender.
+dictionary FileEntry {
+    /// The file name as it should appear on the receiving side.
+    string name;
+    /// The size of the file in bytes.
+    u64 size;
+    /// The file type, when the protocol reports one.
+    string? mime;
+};
+
+/// An incoming transfer waiting for a decision.
+///
+/// The sender's protocol travels with the pending transfer, so a frontend can
+/// badge the request before the user accepts or rejects it.
+dictionary ReceivePending {
+    /// The protocol the sender used.
+    Protocol protocol;
+    /// The identifier of the transfer within its protocol.
+    string transfer_id;
+    /// The sender of the transfer.
+    Peer sender;
+    /// The files the sender offers.
+    sequence<FileEntry> files;
+    /// The total size of all offered files in bytes.
+    u64 total_size;
+};
+
+/// The progress of a transfer.
+dictionary TransferProgress {
+    /// The number of bytes transferred so far.
+    u64 transferred;
+    /// The total number of bytes to transfer.
+    u64 total;
+    /// Whether the transfer finished.
+    boolean finished;
+    /// The reason the transfer failed, when it did.
+    string? error;
+};
+
+/// An event of the unified engine.
+///
+/// The kind is one of `discovered`, `updated`, `lost`, `receive_pending` or
+/// `progress`; the other fields are filled in according to the kind.
+dictionary EngineEvent {
+    /// The kind of the event.
+    string kind;
+    /// The peer the event is about, for the discovery events.
+    Peer? peer;
+    /// The pending transfer, for the receive events.
+    ReceivePending? pending;
+    /// The progress, for the progress events.
+    TransferProgress? progress;
+};
+
+/// The unified Satella engine.
+///
+/// The engine owns one runtime and every protocol adapter. All its methods
+/// block until the operation finishes, because the UniFFI boundary is
+/// synchronous.
+interface Engine {
+    /// Builds an engine with every protocol adapter.
+    constructor();
+
+    /// Starts every adapter and returns the protocols that are running.
+    [Throws=SatellaError]
+    sequence<string> start();
+
+    /// The peers known across all adapters.
+    sequence<Peer> peers();
+
+    /// The peers known for one protocol.
+    sequence<Peer> peers_for(Protocol protocol);
+
+    /// The next event of any adapter. Blocks until one arrives.
+    EngineEvent? next_event();
+
+    /// Sends files to a peer.
+    [Throws=SatellaError]
+    void send(Peer peer, sequence<string> file_paths);
+
+    /// Accepts an incoming transfer, writing the files into the directory.
+    [Throws=SatellaError]
+    void accept(ReceivePending pending, string destination);
+
+    /// Rejects an incoming transfer.
+    [Throws=SatellaError]
+    void reject(ReceivePending pending);
+
+    /// Stops every adapter.
+    void stop();
+};
+
+namespace satella {
+    /// The version of the Satella engine.
+    string version();
+};

@@ -1,0 +1,27 @@
+[package]
+name = "satella-localsend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LocalSend protocol v2 adapter for Satella."
+
+[dependencies]
+satella-core.workspace = true
+
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+async-stream = "0.3"
+mime_guess = "2.0"
+reqwest = { version = "0.13", features = ["stream"], default-features = false }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+satella-localsend-vendor = { path = "vendor/localsend-core", features = ["discovery", "http", "multicast", "crypto"] }
+
+[dev-dependencies]
+satella-localsend-vendor = { path = "vendor/localsend-core", features = ["discovery", "http", "multicast", "crypto"] }

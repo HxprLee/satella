@@ -1,0 +1,21 @@
+[package]
+name = "satella-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Concurrent runtime that runs Satella's protocol adapters side by side and merges their events."
+
+[dependencies]
+satella-core.workspace = true
+
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
