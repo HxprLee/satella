@@ -15,14 +15,30 @@ use satella_localsend::{Config, LocalSendAdapter};
 /// The alias the discovering adapter must find.
 const PEER_ALIAS: &str = "satella-check-peer";
 
+/// An identity path of its own, so that two adapters in one process are two
+/// different devices.
+///
+/// A shared path means a shared certificate, and a peer ignores a device
+/// whose fingerprint is its own. That is what makes a restart look like the
+/// same device, and it is why the two adapters here have to differ.
+fn own_identity_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "satella-discovery-{name}-{}-{:?}.pem",
+        std::process::id(),
+        std::thread::current().id()
+    ))
+}
+
 #[tokio::test]
 async fn the_localsend_adapter_discovers_a_peer() {
     let discoverer = Arc::new(LocalSendAdapter::new(Config {
         alias: "satella-check-discoverer".to_owned(),
+        identity_path: Some(own_identity_path("discoverer")),
         ..Config::default()
     }));
     let target = Arc::new(LocalSendAdapter::new(Config {
         alias: PEER_ALIAS.to_owned(),
+        identity_path: Some(own_identity_path("target")),
         ..Config::default()
     }));
 

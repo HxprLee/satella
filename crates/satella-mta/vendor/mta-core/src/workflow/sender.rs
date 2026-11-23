@@ -34,6 +34,8 @@ pub struct SendOptions {
     pub use_5ghz: bool,
     /// 发送者名称
     pub sender_name: String,
+    /// 存放持久身份的路径。`None` 表示不持久化。
+    pub identity_path: Option<PathBuf>,
 }
 
 impl Default for SendOptions {
@@ -44,6 +46,7 @@ impl Default for SendOptions {
             sender_name: hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "Cattysend".to_string()),
+            identity_path: None,
         }
     }
 }
@@ -63,7 +66,10 @@ impl Sender {
             ..Default::default()
         });
 
-        let security = Arc::new(BleSecurityPersistent::new()?);
+        let security = match &options.identity_path {
+            Some(path) => Arc::new(BleSecurityPersistent::load_or_create(path)?),
+            None => Arc::new(BleSecurityPersistent::new()?),
+        };
 
         Ok(Self {
             options,
@@ -122,8 +128,10 @@ impl Sender {
         };
 
         // 启动传输服务器
+        //
+        // 接收端用 `wss://` 和 `https://` 连接，所以必须是 TLS。
         let mut server = TransferServer::new(task);
-        let port = server.start().await?;
+        let port = server.start_tls().await?;
 
         callback.on_status(&format!("服务器启动于端口 {}", port));
 
@@ -133,57 +141,72 @@ impl Sender {
         callback.on_status(&format!("热点已创建: {}", p2p_info.ssid));
 
         // 连接到接收端 BLE 设备
-        callback.on_status("连接到接收端...");
+        // 热点建好以后的每一步都可能失败；不管成败都要把热点和 DHCP 收掉，
+        // 否则下一次发送会撞上一个残留的组。
+        let transfer = async {
+            callback.on_status("连接到接收端...");
 
-        let ble_client = BleClient::new().await?.with_security(self.security.clone());
-        let _device_info = ble_client
-            .connect_and_handshake(&device.address, &p2p_info, &sender_id)
-            .await?;
+            let ble_client = BleClient::new().await?.with_security(self.security.clone());
+            let _device_info = ble_client
+                .connect_and_handshake_named(
+                    &device.address,
+                    Some(&device.name),
+                    &p2p_info,
+                    &sender_id,
+                )
+                .await?;
 
-        callback.on_status("等待接收端连接...");
+            callback.on_status("等待接收端连接...");
 
-        // 订阅传输状态
-        let mut status_rx = server.subscribe_status_async().await;
+            // 订阅传输状态
+            let mut status_rx = server.subscribe_status_async().await;
 
-        // 等待传输完成或超时
-        let timeout = std::time::Duration::from_secs(300); // 5 分钟超时
-        let result = tokio::time::timeout(timeout, async {
-            loop {
-                match status_rx.recv().await {
-                    Ok(crate::transfer::TransferStatus::Completed) => {
-                        callback.on_status("传输完成！");
-                        return Ok(());
+            // 等待传输完成或超时
+            let timeout = std::time::Duration::from_secs(300); // 5 分钟超时
+            let result = tokio::time::timeout(timeout, async {
+                loop {
+                    match status_rx.recv().await {
+                        Ok(crate::transfer::TransferStatus::Completed) => {
+                            return Ok(());
+                        }
+                        Ok(crate::transfer::TransferStatus::Rejected(reason)) => {
+                            return Err(anyhow::anyhow!("接收端拒绝: {}", reason));
+                        }
+                        Ok(crate::transfer::TransferStatus::Transferring { progress }) => {
+                            let percent = (progress * 100.0) as u64;
+                            callback.on_progress(percent, 100);
+                        }
+                        Ok(crate::transfer::TransferStatus::Failed(e)) => {
+                            return Err(anyhow::anyhow!("传输失败: {}", e));
+                        }
+                        Err(e) => {
+                            // 通道关闭，可能是服务器停止
+                            return Err(anyhow::anyhow!("状态通道错误: {}", e));
+                        }
+                        _ => {}
                     }
-                    Ok(crate::transfer::TransferStatus::Rejected(reason)) => {
-                        return Err(anyhow::anyhow!("接收端拒绝: {}", reason));
-                    }
-                    Ok(crate::transfer::TransferStatus::Transferring { progress }) => {
-                        let percent = (progress * 100.0) as u64;
-                        callback.on_progress(percent, 100);
-                    }
-                    Ok(crate::transfer::TransferStatus::Failed(e)) => {
-                        return Err(anyhow::anyhow!("传输失败: {}", e));
-                    }
-                    Err(e) => {
-                        // 通道关闭，可能是服务器停止
-                        return Err(anyhow::anyhow!("状态通道错误: {}", e));
-                    }
-                    _ => {}
                 }
+            })
+            .await;
+
+            match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("传输超时")),
             }
-        })
+        }
         .await;
 
-        // 清理
-        self.wifi_sender.stop_group().await?;
+        if let Err(err) = self.wifi_sender.stop_group().await {
+            log::warn!("Could not stop the P2P group: {err}");
+        }
 
-        match result {
-            Ok(Ok(())) => {
+        match transfer {
+            Ok(()) => {
+                callback.on_status("传输完成！");
                 callback.on_complete();
                 Ok(())
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow::anyhow!("传输超时")),
+            Err(e) => Err(e),
         }
     }
 }

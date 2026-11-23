@@ -80,8 +80,10 @@ is the whole point of the design.
 # List the peers of every protocol, each row labelled with its protocol
 cargo run -p satella-cli -- discover --seconds 30
 
-# Send files to a peer, found by its fingerprint
-cargo run -p satella-cli -- send <fingerprint> ./photo.jpg
+# Send files to a peer, found by its fingerprint.
+# MTA sends need a real Wi-Fi Direct group owner, which needs root on Linux;
+# the other protocols work unelevated.
+sudo cargo run -p satella-cli -- send <fingerprint> ./photo.jpg
 
 # Accept incoming transfers into a directory
 cargo run -p satella-cli -- receive ./downloads
@@ -102,15 +104,19 @@ cargo doc --workspace --no-deps
 ## Platform notes
 
 - **Linux** is the first-class target. LocalSend uses UDP multicast and
-  HTTPS; MTA uses BlueZ over BLE GATT and NetworkManager for the Wi-Fi Direct
-  hop; Quick Share uses mDNS.
+  HTTPS; MTA uses BlueZ over BLE GATT, NetworkManager to join a group, and
+  wpa_supplicant to create the Wi-Fi Direct group when sending; Quick Share
+  uses mDNS.
 - **Android** needs the BLE permissions and a foreground service for the
   background transfer, which is what the Android frontend shell owns. The
   library itself needs no platform-specific code.
 - **Windows** is supported for the LocalSend and Quick Share paths. The MTA
   adapter needs a WinRT BLE implementation, which is not vendored yet.
 
-Nothing in the core needs `sudo` or raw sockets.
+MTA sending is the one part that needs `sudo`: wpa_supplicant's D-Bus API,
+which creates the Wi-Fi Direct group owner that Android receivers require, is
+root-only. It also needs `dnsmasq` on `PATH` to hand out addresses inside the
+group. LocalSend and Quick Share need no elevated privileges.
 
 ## License
 

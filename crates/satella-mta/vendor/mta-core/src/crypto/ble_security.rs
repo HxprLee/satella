@@ -16,8 +16,9 @@
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::{Engine as _, engine::general_purpose};
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use p256::pkcs8::EncodePublicKey;
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use p256::{PublicKey, ecdh::EphemeralSecret};
 use rand::rngs::OsRng;
 
@@ -26,6 +27,11 @@ type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 /// CatShare 使用的固定 IV：字符串 "0102030405060708" 的 ASCII 字节
 /// 实际字节: [0x30, 0x31, 0x30, 0x32, 0x30, 0x33, 0x30, 0x34, 0x30, 0x35, 0x30, 0x36, 0x30, 0x37, 0x30, 0x38]
 const AES_IV: &[u8; 16] = b"0102030405060708";
+
+/// 从随机数据生成发送方 ID。
+fn sender_id_from_random_data(random_data: &[u8; 2]) -> String {
+    format!("{:02x}{:02x}", random_data[0], random_data[1])
+}
 
 /// BLE 安全上下文 - 管理 ECDH 密钥对
 ///
@@ -285,6 +291,8 @@ impl SessionCipherRef<'_> {
 pub struct BleSecurityPersistent {
     secret_key: p256::SecretKey,
     public_key_b64: String,
+    /// 发送方 ID：对端用它识别这台设备。
+    sender_id: String,
 }
 
 impl BleSecurityPersistent {
@@ -307,7 +315,111 @@ impl BleSecurityPersistent {
         Ok(Self {
             secret_key,
             public_key_b64,
+            sender_id: sender_id_from_random_data(&rand::random::<[u8; 2]>()),
         })
+    }
+
+    /// 载入或创建持久化的身份。
+    ///
+    /// 身份由两部分组成：ECDH 密钥对和发送方 ID。两者都必须跨重启保持
+    /// 不变，否则对端会把这台设备当成新设备（互传联盟的客户端按广播里的
+    /// 身份去重）。
+    pub fn load_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match Self::parse(&contents) {
+                Some(identity) => {
+                    debug!("Loaded the persistent BLE identity from {}", path.display());
+                    Ok(identity)
+                }
+                None => {
+                    warn!(
+                        "the stored BLE identity at {} is unusable, creating a new one",
+                        path.display()
+                    );
+                    let identity = Self::new()?;
+                    identity.store(path)?;
+                    Ok(identity)
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let identity = Self::new()?;
+                identity.store(path)?;
+                Ok(identity)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// 解析身份文件：先是 Base64 的私钥 DER，然后是发送方 ID。
+    fn parse(contents: &str) -> Option<Self> {
+        let mut lines = contents.lines();
+        let secret_key_b64 = lines.next()?.trim();
+        let sender_id = lines.next()?.trim().to_owned();
+
+        if sender_id.is_empty() {
+            return None;
+        }
+
+        let der = general_purpose::STANDARD.decode(secret_key_b64).ok()?;
+        let secret_key = p256::SecretKey::from_pkcs8_der(&der).ok()?;
+        let spki_der = secret_key
+            .public_key()
+            .to_public_key_der()
+            .ok()?
+            .as_bytes()
+            .to_vec();
+
+        Some(Self {
+            secret_key,
+            public_key_b64: general_purpose::STANDARD.encode(spki_der),
+            sender_id,
+        })
+    }
+
+    /// 把身份写入文件，只有本人可读。
+    fn store(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let der = self.secret_key.to_pkcs8_der()?;
+        let contents = format!(
+            "{}\n{}\n",
+            general_purpose::STANDARD.encode(der.as_bytes()),
+            self.sender_id
+        );
+
+        // 先写临时文件再改名，这样中断不会留下半个文件。
+        let temp = path.with_extension("tmp");
+        {
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = file.metadata()?.permissions();
+                perms.set_mode(0o600);
+                file.set_permissions(perms)?;
+            }
+        }
+
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    }
+
+    /// 发送方 ID：对端用它识别这台设备，必须跨重启保持不变。
+    pub fn sender_id(&self) -> &str {
+        &self.sender_id
+    }
+
+    /// 用给定的 ID 创建身份（首次创建时）。
+    pub fn with_sender_id(mut self, sender_id: &str) -> Self {
+        self.sender_id = sender_id.to_owned();
+        self
     }
 
     /// 获取 Base64 编码的公钥
@@ -455,6 +567,44 @@ mod tests {
         // 验证可以解析
         let parsed = BleSecurity::parse_public_key(&spki_bytes);
         assert!(parsed.is_ok(), "Should parse SPKI format");
+    }
+
+    /// 身份必须跨重启保持不变，否则对端会把这台设备当成新设备。
+    #[test]
+    fn test_identity_survives_a_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("satella-mta-identity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity");
+
+        let first = BleSecurityPersistent::load_or_create(&path).unwrap();
+        let first_sender_id = first.sender_id().to_owned();
+        let first_public_key = first.get_public_key().to_owned();
+
+        let second = BleSecurityPersistent::load_or_create(&path).unwrap();
+        assert_eq!(
+            first_sender_id,
+            second.sender_id(),
+            "the sender ID has to survive a reload"
+        );
+        assert_eq!(
+            first_public_key,
+            second.get_public_key(),
+            "the public key has to survive a reload"
+        );
+
+        // 同一个身份派生出的会话密钥必须和之前一致，否则对端会认为
+        // 密钥变了。
+        let peer = BleSecurity::new().unwrap();
+        assert_eq!(
+            first.derive_session_key(peer.get_public_key()).unwrap().key,
+            second
+                .derive_session_key(peer.get_public_key())
+                .unwrap()
+                .key
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 测试空数据加密

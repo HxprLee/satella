@@ -10,6 +10,7 @@ description = "LocalSend protocol v2 adapter for Satella."
 satella-core.workspace = true
 
 async-trait.workspace = true
+anyhow.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,8 +18,11 @@ tokio.workspace = true
 tracing.workspace = true
 
 async-stream = "0.3"
+dirs = "5"
 mime_guess = "2.0"
+pem = "3"
 reqwest = { version = "0.13", features = ["stream"], default-features = false }
+sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 satella-localsend-vendor = { path = "vendor/localsend-core", features = ["discovery", "http", "multicast", "crypto"] }

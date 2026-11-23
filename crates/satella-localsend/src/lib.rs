@@ -35,6 +35,8 @@ use satella_localsend_vendor::model::transfer::FileContent;
 use satella_localsend_vendor::multicast::{MulticastDevice, DEFAULT_MULTICAST_GROUP, DEFAULT_PORT};
 use satella_localsend_vendor::util::interface::InterfaceFilter;
 
+pub mod identity;
+
 /// The LocalSend protocol version this adapter speaks.
 const PROTOCOL_VERSION: &str = "2.2";
 
@@ -52,6 +54,20 @@ pub struct Config {
     pub use_tls: bool,
     /// The network interfaces discovery is allowed to use.
     pub interface_filter: InterfaceFilter,
+    /// Where the device identity is stored.
+    ///
+    /// The identity is the certificate that proves this device to its peers.
+    /// Its fingerprint is how peers tell devices apart, so it has to survive
+    /// a restart: a fresh identity on every launch makes every other
+    /// LocalSend client show this device again and again, as a new one.
+    ///
+    /// `None` keeps the identity in memory only, which makes every launch
+    /// look like a new device.
+    ///
+    /// ponytail: two instances sharing one path share one identity, and the
+    /// peers then see one device with two ports, of which only one answers.
+    /// Give each instance its own path when several run at the same time.
+    pub identity_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -66,8 +82,17 @@ impl Default for Config {
             port: 0,
             use_tls: true,
             interface_filter: InterfaceFilter::default(),
+            identity_path: default_identity_path(),
         }
     }
+}
+
+/// The default location of the device identity.
+///
+/// The name is per user, so two users on one machine are two devices.
+fn default_identity_path() -> Option<PathBuf> {
+    let dir = dirs::config_dir()?.join("satella");
+    Some(dir.join("localsend-identity.pem"))
 }
 
 /// The LocalSend adapter.
@@ -165,10 +190,18 @@ impl ProtocolAdapter for LocalSendAdapter {
     }
 
     async fn start(&self, events: EventSender) -> AdapterResult<()> {
-        let identity = generate_self_signed().map_err(|err| AdapterError::Startup {
-            protocol: Protocol::LocalSend,
-            reason: err.to_string(),
-        })?;
+        let identity = match &self.config.identity_path {
+            Some(path) => identity::load_or_create(path).map_err(|err| AdapterError::Startup {
+                protocol: Protocol::LocalSend,
+                reason: err.to_string(),
+            })?,
+            // Without a place to keep it, the identity is lost on every
+            // restart, and every peer sees this device as a new one.
+            None => generate_self_signed().map_err(|err| AdapterError::Startup {
+                protocol: Protocol::LocalSend,
+                reason: err.to_string(),
+            })?,
+        };
 
         let (event_tx, mut event_rx) = mpsc::channel::<DiscoveryEvent>(256);
         let (server_event_tx, mut server_event_rx) = mpsc::channel::<ServerEventV2>(256);

@@ -128,6 +128,15 @@ impl GattServer {
 
     /// 设置安全上下文，用于自动解密 P2P 信息
     pub fn with_security(mut self, security: Arc<BleSecurityPersistent>) -> Self {
+        // 广播里的身份（随机数据和发送方 ID）必须和密钥对一样跨重启保持
+        // 不变，否则对端会把这台设备当成新设备。
+        let sender_id = security.sender_id().to_owned();
+        if let Ok(bytes) = hex::decode(&sender_id)
+            && bytes.len() == 2
+        {
+            self.random_data = [bytes[0], bytes[1]];
+            self.sender_id = sender_id;
+        }
         self.security = Some(security);
         self
     }

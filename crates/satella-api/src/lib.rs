@@ -294,7 +294,19 @@ pub struct Engine {
 
 impl Engine {
     /// Builds an engine with every protocol adapter.
+    ///
+    /// The device identity is stored in the user's config directory. On a
+    /// platform that has no such directory, use [`Engine::with_storage_dir`].
     pub fn new() -> Self {
+        Self::with_storage_dir(None)
+    }
+
+    /// Builds an engine that keeps its device identity in `storage_dir`.
+    ///
+    /// The identity is the certificate the peers recognize this device by.
+    /// It has to survive a restart, or every LocalSend client shows this
+    /// device as a new one on every launch.
+    pub fn with_storage_dir(storage_dir: Option<String>) -> Self {
         let tokio = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -302,10 +314,14 @@ impl Engine {
                 .expect("the Tokio runtime must build"),
         );
 
+        let mut localsend_config = satella_localsend::Config::default();
+        if let Some(dir) = storage_dir {
+            localsend_config.identity_path =
+                Some(PathBuf::from(dir).join("localsend-identity.pem"));
+        }
+
         let adapters: Vec<Arc<dyn ProtocolAdapter>> = vec![
-            Arc::new(satella_localsend::LocalSendAdapter::new(
-                satella_localsend::Config::default(),
-            )),
+            Arc::new(satella_localsend::LocalSendAdapter::new(localsend_config)),
             Arc::new(satella_quickshare::QuickShareAdapter::new(
                 satella_quickshare::Config::default(),
             )),

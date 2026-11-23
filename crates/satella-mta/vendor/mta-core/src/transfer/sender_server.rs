@@ -172,6 +172,184 @@ impl TransferServer {
 
         Ok(port)
     }
+
+    /// 启动带 TLS 的传输服务器
+    ///
+    /// 接收端用 `wss://` 和 `https://` 连接，所以发送端必须提供 TLS。
+    /// 证书是自签名的：接收端不校验它，只校验内容。
+    pub async fn start_tls(&mut self) -> anyhow::Result<u16> {
+        let state = self.state.clone();
+
+        let app = Router::new()
+            .route("/download", get(download_handler))
+            .route("/websocket", get(websocket_upgrade))
+            .with_state(state);
+
+        let tls = tls_config()?;
+        // `axum-server` takes a blocking listener and converts it itself.
+        let listener = std::net::TcpListener::bind("0.0.0.0:0")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        self.port = port;
+
+        info!("Transfer server listening on port {} (TLS)", port);
+
+        let server = axum_server::from_tcp_rustls(
+            listener,
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls)),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = server.serve(app.into_make_service()).await {
+                error!("TLS transfer server error: {}", e);
+            }
+        });
+
+        Ok(port)
+    }
+}
+
+/// Builds a TLS configuration with a fresh self-signed certificate.
+///
+/// The receiver connects with `danger_accept_invalid_certs`, so the
+/// certificate only has to be well formed.
+fn tls_config() -> anyhow::Result<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let certified = rcgen::generate_simple_self_signed(vec!["satella.local".to_owned()])?;
+    let cert_der = certified.cert.der().clone();
+    let key_der = certified.signing_key.serialize_der();
+    let certs = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_der,
+    ));
+
+    Ok(rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?)
+}
+
+/// Upgrades an HTTP request to a WebSocket and runs the protocol on it.
+async fn websocket_upgrade(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(state): State<Arc<Mutex<TransferServerState>>>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| handle_websocket_socket(socket, state))
+}
+
+/// Runs the protocol on an upgraded WebSocket.
+async fn handle_websocket_socket(
+    socket: axum::extract::ws::WebSocket,
+    state: Arc<Mutex<TransferServerState>>,
+) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut write, mut read) = socket.split();
+
+    let mut msg_id: u32 = 0;
+
+    // 发送版本协商
+    let ver_msg = WsMessage::version_negotiation(msg_id);
+    if write
+        .send(Message::Text(ver_msg.to_string()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    while let Some(Ok(msg)) = read.next().await {
+        let text = match msg {
+            Message::Text(text) => text.to_string(),
+            Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let Some(ws_msg) = WsMessage::parse(&text) else {
+            warn!("Invalid WebSocket message: {}", text);
+            continue;
+        };
+
+        debug!(
+            "WS received: type={}, name={}",
+            ws_msg.msg_type, ws_msg.name
+        );
+
+        match ws_msg.msg_type.as_str() {
+            "ack" => {
+                if ws_msg.name == "versionNegotiation" {
+                    // 版本协商完成，发送传输请求
+                    msg_id += 1;
+                    let task = {
+                        let s = state.lock().await;
+                        s.task.clone()
+                    };
+
+                    let total_size: u64 = task.files.iter().map(|f| f.size).sum();
+                    let file_name = task
+                        .files
+                        .first()
+                        .map(|f| f.name.clone())
+                        .unwrap_or_default();
+
+                    let send_req = WsMessage::action(
+                        msg_id,
+                        "sendRequest",
+                        Some(serde_json::json!({
+                            "taskId": task.task_id,
+                            "id": task.task_id,
+                            "senderId": task.sender_id,
+                            "senderName": task.sender_name,
+                            "fileName": file_name,
+                            "mimeType": task.files.first().map(|f| &f.mime_type).unwrap_or(&"application/octet-stream".to_string()),
+                            "fileCount": task.files.len(),
+                            "totalSize": total_size
+                        })),
+                    );
+                    if write
+                        .send(Message::Text(send_req.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            "action" => {
+                // 发送 ACK
+                let ack = WsMessage::ack(ws_msg.id, &ws_msg.name, None);
+                if write.send(Message::Text(ack.to_string())).await.is_err() {
+                    break;
+                }
+
+                if ws_msg.name == "status"
+                    && let Some(payload) = &ws_msg.payload
+                {
+                    let status_type = payload.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if status_type == 1 {
+                        // 传输完成
+                        info!("Transfer completed successfully");
+                        let _ = state.lock().await.status_tx.send(TransferStatus::Completed);
+                        break;
+                    } else if status_type == 3 {
+                        // 用户拒绝
+                        info!("Transfer rejected by receiver");
+                        let reason = payload
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("rejected");
+                        let _ = state
+                            .lock()
+                            .await
+                            .status_tx
+                            .send(TransferStatus::Rejected(reason.to_string()));
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 处理 WebSocket 连接

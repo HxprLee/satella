@@ -18,8 +18,35 @@ This crate contains code forked from [Tinnci/cattysend].
   dependency list. The dependency versions are upstream's.
 * The `cattysend-proto` crate was not forked: the core crate does not depend
   on it.
+* `vendor/mta-core/src/wifi/p2p_sender.rs`: the hotspot creation now falls
+  back to 2.4 GHz when the requested band cannot be activated. Some adapters
+  cannot run a 5 GHz access point, and the hotspot then stays in
+  `ACTIVATING` forever.
+* `vendor/mta-core/src/wifi/p2p_sender.rs`: the generated SSID now has the
+  `DIRECT-xx` shape the Mutual Transfer Alliance clients scan for (two hex
+  digits after the prefix). The previous eight-character suffix produced
+  SSIDs the clients ignored.
+* `vendor/mta-core/src/wifi/p2p_sender.rs`: the MAC address sent to the peer
+  is now read from the P2P interface first, as the protocol specification
+  requires the peer to compare it against the group's owner address.
+* `vendor/mta-core/src/wifi/nm_dbus.rs`: hotspot creation now reports the
+  underlying NetworkManager error instead of a generic message.
+* `vendor/mta-core/src/crypto/ble_security.rs`: `BleSecurityPersistent` can
+  now be stored on disk and reloaded. The ECDH key pair and the sender ID
+  have to survive a restart, otherwise the peers see a new device every time
+  this one starts.
+* `vendor/mta-core/src/ble/server.rs`: the GATT server now takes the sender
+  ID and the advertisement random data from the persistent identity, so the
+  device announces the same identity across restarts.
+* `vendor/mta-core/src/workflow/receiver.rs` and
+  `vendor/mta-core/src/workflow/sender.rs`: both workflows take an optional
+  path for the persistent identity.
+* `vendor/mta-core/src/transfer/sender_server.rs`: the transfer server can
+  serve `/websocket` and `/download` over TLS on a single port. The clients
+  connect with `wss://` and `https://`, so plain HTTP does not work.
 
-The Rust sources under `vendor/mta-core/src/` are upstream's, unchanged.
+Apart from the changes listed above, the Rust sources under
+`vendor/mta-core/src/` are upstream's, unchanged.
 
 ## License compatibility
 

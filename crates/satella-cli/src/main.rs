@@ -35,7 +35,8 @@ enum Command {
     },
     /// Send files to a peer.
     Send {
-        /// The fingerprint of the peer to send to.
+        /// The fingerprint of the peer to send to, or `any` for the first
+        /// peer that announces itself.
         fingerprint: String,
         /// The files to send.
         files: Vec<PathBuf>,
@@ -219,6 +220,10 @@ async fn send(mut runtime: Runtime, fingerprint: &str, files: &[PathBuf]) -> Res
 }
 
 /// Waits for the peer with the given fingerprint to be discovered.
+///
+/// The fingerprint `any` matches the first peer of the wanted protocol. Some
+/// protocols use a randomized address that rotates, so the address a peer had
+/// a moment ago may be stale by the time the send starts.
 async fn wait_for_peer(
     runtime: &mut Runtime,
     fingerprint: &str,
@@ -230,7 +235,7 @@ async fn wait_for_peer(
         if let Some(peer) = runtime
             .peers()
             .into_iter()
-            .find(|peer| peer.fingerprint == fingerprint)
+            .find(|peer| fingerprint == "any" || peer.fingerprint == fingerprint)
         {
             return Ok(peer);
         }

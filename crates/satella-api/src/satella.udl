@@ -93,6 +93,15 @@ interface Engine {
     /// Builds an engine with every protocol adapter.
     constructor();
 
+    /// Builds an engine that keeps its device identity in the directory.
+    ///
+    /// The identity is the certificate the peers recognize this device by.
+    /// It has to survive a restart, or every LocalSend client shows this
+    /// device as a new one on every launch. A platform that has no config
+    /// directory of its own passes the app's own directory here.
+    [Name=with_storage_dir]
+    constructor(string? storage_dir);
+
     /// Starts every adapter and returns the protocols that are running.
     [Throws=SatellaError]
     sequence<string> start();

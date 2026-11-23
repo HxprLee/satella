@@ -336,7 +336,7 @@ impl NmClient {
         let conn_path = settings
             .add_connection(connection_settings)
             .await
-            .context("Failed to create hotspot connection")?;
+            .map_err(|err| anyhow::anyhow!("Failed to create hotspot connection: {err}"))?;
 
         info!("Created hotspot connection: {:?}", conn_path);
         Ok(conn_path)
@@ -378,8 +378,29 @@ impl NmClient {
         settings.insert("802-11-wireless-security", wireless_security);
 
         // ipv4 部分 (共享模式 - 自动 DHCP)
+        //
+        // 互传联盟的 P2P 组用 192.168.49.0/24：接收端拿自己地址的网关
+        // （x.x.x.1）来找发送端，NetworkManager 默认的 10.42.0.1 会让它
+        // 连错地方。
+        //
+        // NetworkManager 的 `addresses` 是 `aau`：每个地址是一串 uint32，
+        // 第一项是把地址打包成的小端 32 位数（192.168.49.1 是
+        // 0x0131A8C0），第二项是前缀长度，第三项是网关标志。
+        let packed = 192u32 | (168 << 8) | (49 << 16) | (1 << 24);
+        let mut address = zbus::zvariant::Array::new(
+            zbus::zvariant::Signature::from_static_str("u").expect("valid signature"),
+        );
+        let _ = address.append(Value::U32(packed));
+        let _ = address.append(Value::U32(24));
+        let _ = address.append(Value::U32(0));
+        let mut addresses = zbus::zvariant::Array::new(
+            zbus::zvariant::Signature::from_static_str("au").expect("valid signature"),
+        );
+        let _ = addresses.append(Value::Array(address));
+
         let mut ipv4: HashMap<&str, Value> = HashMap::new();
         ipv4.insert("method", Value::Str("shared".into()));
+        ipv4.insert("addresses", Value::Array(addresses));
         settings.insert("ipv4", ipv4);
 
         // ipv6 部分

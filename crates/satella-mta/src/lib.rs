@@ -6,8 +6,9 @@
 //!
 //! The MTA protocol discovers peers over Bluetooth Low Energy and transfers
 //! the files over a Wi-Fi Direct group, so the adapter needs a working
-//! Bluetooth adapter and a Wi-Fi interface. On Linux both are reached through
-//! BlueZ and NetworkManager, without elevated privileges.
+//! Bluetooth adapter and a Wi-Fi interface. Receiving goes through BlueZ and
+//! NetworkManager; sending needs root to create the Wi-Fi Direct group owner
+//! through wpa_supplicant, because that D-Bus API is root-only.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,6 +37,12 @@ pub struct Config {
     pub wifi_interface: String,
     /// The directory received files are written into.
     pub output_dir: PathBuf,
+    /// Where the persistent identity is kept.
+    ///
+    /// The identity is the ECDH key pair and the sender ID. It has to
+    /// survive a restart, otherwise the peers see this device as a new one
+    /// every time it starts.
+    pub identity_path: PathBuf,
 }
 
 impl Default for Config {
@@ -44,8 +51,17 @@ impl Default for Config {
             device_name: "Satella Device".to_owned(),
             wifi_interface: "wlan0".to_owned(),
             output_dir: dirs::download_dir().unwrap_or_else(|| PathBuf::from(".")),
+            identity_path: default_identity_path(),
         }
     }
+}
+
+/// The default place the persistent identity is kept.
+fn default_identity_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("satella")
+        .join("mta-identity")
 }
 
 /// The MTA adapter.
@@ -114,13 +130,19 @@ impl ProtocolAdapter for MtaAdapter {
                 loop {
                     // The vendor's options type is not cloneable, so it is
                     // rebuilt for every attempt.
+                    //
+                    // `auto_accept` is true: the vendor asks synchronously on
+                    // its transfer task, and the sender times out if the
+                    // answer is not instant. The CLI announces the request
+                    // and accepts it right away anyway.
                     let options = satella_mta_vendor::workflow::ReceiveOptions {
                         device_name: config.device_name.clone(),
                         wifi_interface: config.wifi_interface.clone(),
                         output_dir: config.output_dir.clone(),
-                        auto_accept: false,
+                        auto_accept: true,
                         brand_id: satella_mta_vendor::config::BrandId::Unknown,
                         supports_5ghz: true,
+                        identity_path: Some(config.identity_path.clone()),
                     };
 
                     let Ok(receiver) = satella_mta_vendor::workflow::Receiver::new(options) else {
@@ -129,7 +151,7 @@ impl ProtocolAdapter for MtaAdapter {
                     };
 
                     let (callback, mut event_rx) =
-                        satella_mta_vendor::workflow::SimpleReceiveCallback::new(false);
+                        satella_mta_vendor::workflow::SimpleReceiveCallback::new(true);
 
                     let handle = tokio::spawn(async move { receiver.start(&callback).await });
 
@@ -283,6 +305,7 @@ impl ProtocolAdapter for MtaAdapter {
             wifi_interface: self.config.wifi_interface.clone(),
             use_5ghz: true,
             sender_name: self.config.device_name.clone(),
+            identity_path: Some(self.config.identity_path.clone()),
         })
         .map_err(|err| AdapterError::Startup {
             protocol: Protocol::Mta,
@@ -313,20 +336,37 @@ impl ProtocolAdapter for MtaAdapter {
             }
         }
 
-        let _ = handle.await;
+        // The vendor returns its failures as the task's result, not through
+        // the callback, so the task's outcome is what decides success.
+        // Without this a failed send is reported as a successful one.
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                outcome = Err(AdapterError::Transfer {
+                    protocol: Protocol::Mta,
+                    reason: err.to_string(),
+                });
+            }
+            Err(err) => {
+                outcome = Err(AdapterError::Transfer {
+                    protocol: Protocol::Mta,
+                    reason: err.to_string(),
+                });
+            }
+        }
         outcome
     }
 
     async fn accept(&self, _pending: ReceivePending, _destination: PathBuf) -> AdapterResult<()> {
-        // The MTA engine accepts a transfer as part of its receive workflow,
-        // so an accept decided here only confirms the request the engine
-        // already made.
+        // The vendor already accepted the transfer when it asked: an instant
+        // yes is the only answer the sender waits for. The CLI accepts every
+        // request it announces, so there is nothing left to decide here.
         Ok(())
     }
 
     async fn reject(&self, _pending: ReceivePending) -> AdapterResult<()> {
-        // The MTA engine declines a transfer by not accepting the request, so
-        // there is nothing to undo here.
+        // The transfer was already accepted by the time the application sees
+        // the request, so a reject arrives too late to stop it.
         Ok(())
     }
 }

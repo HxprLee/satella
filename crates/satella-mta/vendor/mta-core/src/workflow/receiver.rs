@@ -51,6 +51,11 @@ pub struct ReceiveOptions {
     pub brand_id: crate::config::BrandId,
     /// 是否支持 5GHz
     pub supports_5ghz: bool,
+    /// 存放持久身份的路径。
+    ///
+    /// 身份（ECDH 密钥对和发送方 ID）必须跨重启保持不变，否则对端会把
+    /// 这台设备当成新设备。`None` 表示不持久化。
+    pub identity_path: Option<PathBuf>,
 }
 
 impl Default for ReceiveOptions {
@@ -64,6 +69,7 @@ impl Default for ReceiveOptions {
             auto_accept: false,
             brand_id: crate::config::BrandId::Xiaomi,
             supports_5ghz: true,
+            identity_path: None,
         }
     }
 }
@@ -76,7 +82,11 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(options: ReceiveOptions) -> anyhow::Result<Self> {
-        let security = Arc::new(BleSecurityPersistent::new()?);
+        // 身份要跨重启保持不变，所以从文件载入，没有文件才新建。
+        let security = match &options.identity_path {
+            Some(path) => Arc::new(BleSecurityPersistent::load_or_create(path)?),
+            None => Arc::new(BleSecurityPersistent::new()?),
+        };
         Ok(Self { options, security })
     }
 

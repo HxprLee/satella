@@ -1,6 +1,6 @@
 # Satella — State of the Project
 
-**Stage:** v0.1.0, greenfield init complete and verified. Not under version control yet (no `.git`).
+**Stage:** v0.1.0, greenfield init complete and verified, committed.
 
 ---
 
@@ -37,6 +37,8 @@ cargo doc --workspace --no-deps                         ✅
 - Real file transfer end to end — `hello.txt` sent, received, content verified, receiver reporting `incoming transfer over LocalSend`.
 - Two instances discovering each other, both listed.
 - A real BLE MTA device (`4axI`) discovered alongside LocalSend peers in the same merged list.
+- Real MTA receive end to end against a OnePlus 13: BLE handshake, join `DIRECT-…`, DHCP, WSS, download, save.
+- Real MTA send end to end against the same phone: wpa_supplicant group owner on 5 GHz (`DIRECT-gu`), DHCP on 192.168.49.0/24, BLE `P2pInfo`, phone joined, WSS `sendRequest`, ZIP download, status OK. Group, DHCP and address cleaned up afterwards.
 
 **Release artifacts built:** `libsatella.so` (cdylib UniFFI loads), `libsatella.a`, `libsatella.rlib`, plus generated `satella.uniffi.rs` scaffolding.
 
@@ -55,8 +57,8 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 
 ## Known gaps
 
-1. **Quick Share and MTA transfer legs are unverified.** Their `send`/`accept`/`reject` are fully implemented (no `todo!()`/`unimplemented!()` anywhere), and discovery is confirmed against a real device — but a real file transfer over either protocol has not been exercised. This is the obvious next target.
-2. **No git repository.** The project isn't under version control; `git init` and an initial commit are outstanding.
+1. **Quick Share transfer leg is unverified.** Its `send`/`accept`/`reject` are fully implemented (no `todo!()`/`unimplemented!()` anywhere), and discovery is confirmed — but a real file transfer has not been exercised. This is the obvious next target.
+2. **MTA sending needs root on Linux.** Android receivers only join a real Wi-Fi Direct group owner, and wpa_supplicant's D-Bus API is root-only. The CLI must run under `sudo`/`pkexec` for MTA sends; LocalSend and Quick Share stay unelevated. A privileged helper is the likely packaging fix.
 3. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
 4. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
 5. **One global Tokio runtime** at the UniFFI boundary (noted with a `ponytail:` comment): all adapters share one worker pool, so a busy protocol could starve another. Acceptable until Android background-transfer load proves otherwise; then per-adapter executors.

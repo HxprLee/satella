@@ -5,6 +5,7 @@
 //! # 模块
 //!
 //! - `nm_dbus`: NetworkManager D-Bus 客户端 (推荐)
+//! - `p2p_go`: P2P 组所有者 (发送端, 互传联盟的对端只连 P2P 组)
 //! - `p2p_sender`: P2P 热点创建（发送端）
 //! - `p2p_receiver`: P2P 连接（接收端）
 //!
@@ -14,6 +15,7 @@
 //! 敏感字段（SSID、PSK、MAC）可以使用 AES-CTR 加密。
 
 pub mod nm_dbus;
+pub mod p2p_go;
 pub mod p2p_receiver;
 pub mod p2p_sender;
 
