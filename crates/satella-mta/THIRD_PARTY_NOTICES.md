@@ -53,6 +53,15 @@ This crate contains code forked from [Tinnci/cattysend].
 * `vendor/mta-core/src/transfer/sender_server.rs`: the transfer server can
   serve `/websocket` and `/download` over TLS on a single port. The clients
   connect with `wss://` and `https://`, so plain HTTP does not work.
+* `vendor/mta-core/src/wifi/nm_dbus.rs`: added the `Connection` property of
+  the active connection and an `active_wifi_profile` helper, so the sender
+  can find out which saved profile was in use.
+* `vendor/mta-core/src/wifi/p2p_sender.rs`: the Wi-Fi connection that was
+  active before the P2P group was created is now restored when the group is
+  torn down. NetworkManager's `Device.disconnect()` is a user-requested
+  disconnect that permanently blocks autoconnect for the device, so without
+  this the interface stayed down after every MTA send. The restore is
+  skipped when no connection was active to begin with.
 
 Apart from the changes listed above, the Rust sources under
 `vendor/mta-core/src/` are upstream's, unchanged.

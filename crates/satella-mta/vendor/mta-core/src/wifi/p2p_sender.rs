@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use log::{debug, info, warn};
 use tokio::sync::Mutex;
+use zbus::zvariant::OwnedObjectPath;
 
 use crate::wifi::P2pInfo;
 use crate::wifi::nm_dbus::NmClient;
@@ -68,17 +69,20 @@ pub struct WiFiP2pSender {
     config: P2pConfig,
     nm_client: Arc<Mutex<Option<NmClient>>>,
     active_hotspot: Arc<Mutex<Option<ActiveHotspot>>>,
+    /// 建组之前接口上活动的 WiFi 配置，组拆掉以后要把它连回来。
+    previous_wifi_profile: Arc<Mutex<Option<(OwnedObjectPath, String)>>>,
 }
 
 impl WiFiP2pSender {
     pub fn new(interface: &str) -> Self {
         Self {
             config: P2pConfig {
-                interface: interface.to_string(),
+                interface: interface.to_owned(),
                 ..Default::default()
             },
             nm_client: Arc::new(Mutex::new(None)),
             active_hotspot: Arc::new(Mutex::new(None)),
+            previous_wifi_profile: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -87,6 +91,7 @@ impl WiFiP2pSender {
             config,
             nm_client: Arc::new(Mutex::new(None)),
             active_hotspot: Arc::new(Mutex::new(None)),
+            previous_wifi_profile: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -241,6 +246,10 @@ impl WiFiP2pSender {
     ///
     /// 不松开的话，组刚建好 NM 就可能把 `wlan0` 抢回去激活原来的 Wi-Fi，
     /// P2P 组会被直接拆掉。
+    ///
+    /// 断开之前先记住接口上活动的是哪个连接：NM 的 `Device.disconnect()`
+    /// 是「用户请求的断开」，会把设备的 autoconnect 永久挡掉，组拆掉以后
+    /// 不会自己连回来。
     async fn disconnect_from_nm(&self) {
         if let Err(err) = self.ensure_nm_client().await {
             debug!("NetworkManager is not available, leaving the interface alone: {err}");
@@ -254,6 +263,26 @@ impl WiFiP2pSender {
 
         match client.find_wifi_device(Some(&self.config.interface)).await {
             Ok(Some(device)) => {
+                // 必须在断开之前问：断开了就问不到了。
+                match client
+                    .active_wifi_profile(&self.config.interface)
+                    .await
+                {
+                    Ok(Some((profile, id))) => {
+                        info!("Remembering the active WiFi profile {id:?} to restore it later");
+                        *self.previous_wifi_profile.lock().await = Some((profile, id));
+                    }
+                    Ok(None) => {
+                        debug!(
+                            "{} had no active WiFi connection; nothing to restore later",
+                            self.config.interface
+                        );
+                    }
+                    Err(err) => {
+                        warn!("Could not read the active WiFi profile: {err}");
+                    }
+                }
+
                 if let Err(err) = client.disconnect_device(&device).await {
                     warn!(
                         "Could not disconnect NetworkManager from {}: {err}",
@@ -271,6 +300,40 @@ impl WiFiP2pSender {
 
         // 等 NM 真正把接口放下来，再去建组。
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    /// 把建组之前那个 WiFi 连接连回来。
+    ///
+    /// NM 在 `Device.disconnect()` 之后不会再自动连接，所以必须显式重新
+    /// 激活原来的配置。发送之前接口本来就没有连接的话，什么都不做——不能
+    /// 擅自把用户连到一个他没选过的网络上。
+    async fn restore_wifi_connection(&self) -> anyhow::Result<()> {
+        let Some((profile, id)) = self.previous_wifi_profile.lock().await.take() else {
+            debug!("No WiFi profile to restore");
+            return Ok(());
+        };
+
+        if let Err(err) = self.ensure_nm_client().await {
+            return Err(err);
+        }
+
+        let client_guard = self.nm_client.lock().await;
+        let Some(client) = client_guard.as_ref() else {
+            return Ok(());
+        };
+
+        let Some(device) = client.find_wifi_device(Some(&self.config.interface)).await? else {
+            warn!("NetworkManager does not manage {} any more", self.config.interface);
+            return Ok(());
+        };
+
+        let active = client.activate_connection(&profile, &device).await?;
+        client
+            .wait_for_activation(&active.as_ref(), Duration::from_secs(15))
+            .await?;
+
+        info!("Restored the WiFi connection {id:?}");
+        Ok(())
     }
 
     /// 使用 NetworkManager D-Bus 创建热点
@@ -339,6 +402,7 @@ impl WiFiP2pSender {
 
         let hotspot = self.active_hotspot.lock().await.take();
 
+        let mut teardown_error = None;
         match hotspot {
             Some(ActiveHotspot::NetworkManager {
                 connection_name, ..
@@ -354,13 +418,22 @@ impl WiFiP2pSender {
             Some(ActiveHotspot::GroupOwner { backend, group }) => {
                 debug!("Destroying the P2P group on {}", group.interface);
                 if let Err(err) = backend.destroy_group().await {
-                    return Err(err);
+                    teardown_error = Some(err);
                 }
             }
             None => {}
         }
 
-        Ok(())
+        // 组没了以后才把 WiFi 连回来：组还在的时候 NM 会和它抢接口，组会被
+        // 直接拆掉。恢复失败只记警告——传输这时已经成功了，不能因此报错。
+        if let Err(err) = self.restore_wifi_connection().await {
+            warn!("Could not restore the previous WiFi connection: {err:#}");
+        }
+
+        match teardown_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// 获取接口 MAC 地址

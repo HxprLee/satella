@@ -175,6 +175,13 @@ trait NmActiveConnection {
     /// IP4 配置对象路径
     #[zbus(property)]
     fn ip4_config(&self) -> zbus::Result<OwnedObjectPath>;
+
+    /// 保存的连接配置路径
+    ///
+    /// 这是 `/org/freedesktop/NetworkManager/Settings/...` 下的 profile，
+    /// `activate_connection()` 要的就是这个路径。
+    #[zbus(property)]
+    fn connection(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
 /// NetworkManager.IP4Config 接口代理
@@ -318,6 +325,45 @@ impl NmClient {
                 .into_iter()
                 .find(|d| d.device_type == device_type::WIFI))
         }
+    }
+
+    /// 接口上当前活动的 WiFi 连接配置。
+    ///
+    /// 返回 `(配置路径, 配置名)`；接口没有活动连接时返回 `None`。
+    ///
+    /// 建 P2P 组之前要记住这个：NM 的 `Device.disconnect()` 会把设备的
+    /// autoconnect 永久挡掉（reason 39），组拆掉以后不会自己连回来，只能
+    /// 显式重新激活原来那个配置。
+    pub async fn active_wifi_profile(
+        &self,
+        interface: &str,
+    ) -> Result<Option<(OwnedObjectPath, String)>> {
+        let Some(device) = self.find_wifi_device(Some(interface)).await? else {
+            return Ok(None);
+        };
+
+        let device_proxy = NmDeviceProxy::builder(&self.connection)
+            .path(&device.path)?
+            .build()
+            .await?;
+
+        let active = device_proxy.active_connection().await?;
+        if active.as_str() == "/" {
+            return Ok(None);
+        }
+
+        let active_proxy = NmActiveConnectionProxy::builder(&self.connection)
+            .path(&active)?
+            .build()
+            .await?;
+
+        let profile = active_proxy.connection().await?;
+        if profile.as_str() == "/" {
+            return Ok(None);
+        }
+
+        let id = active_proxy.id().await.unwrap_or_default();
+        Ok(Some((profile, id)))
     }
 
     /// 创建 WiFi 热点连接配置

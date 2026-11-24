@@ -49,6 +49,7 @@ cargo doc --workspace --no-deps                         ✅
 - Unprivileged helper path (2026-11-24): built and installed `satella-mta-helper` plus the polkit action/rule; ran `sender_create_group_integration` and `sender_cleans_up_when_ble_fails` as user `lee` with `SATELLA_MTA_HELPER=/usr/libexec/satella-mta-helper`, no outer `pkexec` and no password prompt. Both passed; no dnsmasq, GO address, P2P-GO or pid file survived. A full CLI send against the phone was not re-run in this session: discovery saw 0 BLE devices (phone not advertising), so the phone-side leg still rests on the 2026-11-23 evidence.
 - In-process backend (2026-11-24): `sender_create_group_integration` under `pkexec` also passed, so the root/probe path survived the backend refactor and cleaned up the same way.
 - Re-verification of the sudo-less path (2026-11-24, independent of the implementing session): as uid 1000, with no outer `pkexec`, `sender_create_group_integration` and `sender_cleans_up_when_ble_fails` both passed three times in a row against the installed `/usr/libexec/satella-mta-helper` — no password prompt on any invocation, confirming the permanent `Result.YES` grant. The action resolves to `org.satella.mta.manage-p2p` with `org.freedesktop.policykit.exec.path -> /usr/libexec/satella-mta-helper`, so the grant covers only that binary. The helper refuses to run as non-root, rejects unknown commands, unsafe interface names and out-of-band frequencies (all exit 1), and `destroy` kills only the PID in the root-owned pid file after confirming `/proc/<pid>/comm` is `dnsmasq`. After each run no GO address, dnsmasq, P2P-GO interface or pid file survived. `satella-cli discover` ran unprivileged and reused the existing user-owned `~/.config/satella/mta-identity` (mtime unchanged), so the BLE fingerprint stays stable. The phone-side leg still rests on the 2026-11-23 evidence: discovery saw 0 BLE devices during this session.
+- Wi-Fi restore after P2P cleanup (2026-11-24): the sender now re-activates the Wi-Fi profile that was active before the P2P group was created. Verified through the real sender path as uid 1000 via the helper: connected to `Mr Breast` → P2P group → cleanup → `GENERAL.STATE: 100 (connected)`, `GENERAL.REASON: 0`, same profile re-activated. The "already disconnected" case was verified to stay disconnected, so the sender never hijacks a network the user did not choose. The new probe `sender_restores_wifi_after_the_group_is_torn_down` was falsified: with the restore disabled it fails (`AFTER profile=None`), and it passes with the fix in place.
 
 **Release artifacts built:** `libsatella.so` (cdylib UniFFI loads), `libsatella.a`, `libsatella.rlib`, plus generated `satella.uniffi.rs` scaffolding.
 
@@ -88,15 +89,17 @@ Sequence:
    rejected.
 6. `stop_group` always runs after the group exists (also on BLE, GATT, WS and
    timeout failures): stop `dnsmasq`, `Disconnect` the group, remove
-   `192.168.49.1/24`. It does **not** bring Wi-Fi back; the interface stays
-   down until NetworkManager reconnects a profile.
+   `192.168.49.1/24`, and then re-activate the Wi-Fi profile that was active
+   before the group was created. The restore has to happen after the group is
+   gone, otherwise NetworkManager fights the group and tears it down again.
+   It is skipped when there was no active connection to begin with.
 
 ### Files
 
 | File | Role |
 |---|---|
 | `crates/satella-mta/vendor/mta-core/src/wifi/p2p_go.rs` | wpa_supplicant D-Bus GO, IP configuration, dnsmasq lifecycle, `GroupOwnerBackend`, in-process and helper backends. |
-| `crates/satella-mta/vendor/mta-core/src/wifi/p2p_sender.rs` | GO-first `create_group`, backend selection, NetworkManager fallback, `ActiveHotspot` enum, `stop_group`, `DIRECT-xx` SSID. |
+| `crates/satella-mta/vendor/mta-core/src/wifi/p2p_sender.rs` | GO-first `create_group`, backend selection, NetworkManager fallback, `ActiveHotspot` enum, `stop_group`, Wi-Fi restore, `DIRECT-xx` SSID. |
 | `crates/satella-mta-helper/src/main.rs` | Narrow root helper: fixed `create`/`destroy`, interface/frequency validation, JSON output, one operation per process. |
 | `packaging/org.satella.mta.policy` | Dedicated polkit action bound to `/usr/libexec/satella-mta-helper`. |
 | `packaging/60-satella-mta.rules` | Permanent `polkit.Result.YES` for local `wheel`, so later sends never prompt. |
@@ -104,7 +107,7 @@ Sequence:
 | `crates/satella-mta/vendor/mta-core/src/ble/client.rs` | Address scan, unique-name fallback, connect/read/write retries. |
 | `crates/satella-mta/vendor/mta-core/src/transfer/sender_server.rs` | TLS axum server, `/websocket` protocol, ZIP `/download`. |
 | `crates/satella-mta/src/lib.rs` | Satella adapter wiring, identity path, propagates the vendor task result as the send result. |
-| `crates/satella-mta/vendor/mta-core/tests/p2p_go_probe.rs` | Ignored root/hardware probes for GO+DHCP, sender integration and failure cleanup. |
+| `crates/satella-mta/vendor/mta-core/tests/p2p_go_probe.rs` | Ignored root/hardware probes for GO+DHCP, sender integration, failure cleanup and Wi-Fi restore. |
 | `crates/satella-mta/THIRD_PARTY_NOTICES.md` | Every vendored change, for future upstream rebases. |
 
 ### Running a live send
@@ -143,8 +146,15 @@ timeout 180 env \
 pgrep -a dnsmasq || echo "no dnsmasq"
 ip -br addr show wlan0            # no 192.168.49.1/24
 iw dev wlan0 info | grep type     # no P2P-GO
-nmcli connection up "Mr Breast"   # local Wi-Fi profile on this machine
+nmcli -f GENERAL.STATE dev show wlan0   # connected again (see below)
 ```
+
+The sender restores the Wi-Fi connection that was active before the P2P group
+was created, so `wlan0` comes back on its own profile. NetworkManager's
+`Device.disconnect()` is a *user-requested* disconnect: it sets the device's
+autoconnect block, so NM never reconnects by itself and the interface used to
+stay down after every send. If the interface had no connection to begin with,
+nothing is restored.
 
 Normal runs keep the identity at `~/.config/satella/mta-identity`; the old
 `/root/.config/satella/mta-identity` from whole-CLI elevations is obsolete.
@@ -163,6 +173,7 @@ PROBE=./target/debug/deps/p2p_go_probe-<hash>
 # Sender cases as an ordinary user exercise HelperGroupOwner (helper installed):
 timeout 120 $PROBE sender_create_group_integration --ignored --nocapture
 timeout 120 $PROBE sender_cleans_up_when_ble_fails --ignored --nocapture
+timeout 120 $PROBE sender_restores_wifi_after_the_group_is_torn_down --ignored --nocapture
 
 # The raw D-Bus case has no helper wrapper, so it still needs root:
 timeout 120 pkexec $PROBE p2p_go_starts_and_serves_dhcp --ignored --nocapture
@@ -177,10 +188,14 @@ Cases:
   `type P2P-GO` and `192.168.49.1/24`.
 - `sender_cleans_up_when_ble_fails` — ghost peer; asserts no dnsmasq, no
   address, no P2P-GO afterwards.
+- `sender_restores_wifi_after_the_group_is_torn_down` — asserts the Wi-Fi
+  profile that was active before the send is active again afterwards. Needs a
+  Wi-Fi connection up beforehand; it panics otherwise.
 
-All three leave `wlan0` down. Restore NetworkManager when done. Rebuild the
-probe after source edits: the reported hash changes, and an old binary can
-hide a cleanup regression.
+The sender cases restore the Wi-Fi connection themselves. The raw D-Bus case
+still leaves `wlan0` down, so restore NetworkManager after it by hand.
+Rebuild the probe after source edits: the reported hash changes, and an old
+binary can hide a cleanup regression.
 
 ### Traps
 
@@ -235,9 +250,10 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 1. **Quick Share transfer leg is unverified.** Its `send`/`accept`/`reject` are fully implemented (no `todo!()`/`unimplemented!()` anywhere), and discovery is confirmed — but a real file transfer has not been exercised. This is the obvious next target.
 2. **MTA sending needs a one-time Linux helper install.** Android receivers only join a real Wi-Fi Direct group owner, and wpa_supplicant's D-Bus API is root-only. The privileged operations now live in `satella-mta-helper` plus a packaged polkit action, so the CLI stays unprivileged and keeps `~/.config/satella/mta-identity`. Without that install, MTA send still needs the whole CLI under `sudo`/`pkexec`, or it falls back to the Satella-only NetworkManager hotspot. Distro packaging for the helper/policy files is still manual.
 3. **mDNS/LocalSend error spam while `wlan0` is a GO.** Sockets still point at the previous address and log “Network is unreachable”. Cosmetic; suppress or rebind while the GO is up.
-4. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
-5. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
-6. **One global Tokio runtime** at the UniFFI boundary (noted with a `ponytail:` comment): all adapters share one worker pool, so a busy protocol could starve another. Acceptable until Android background-transfer load proves otherwise; then per-adapter executors.
+4. **NetworkManager keeps a stale `p2p-dev-wlan0` device.** The kernel interface is gone after the group is destroyed, but NM still lists the P2P device object. It does not block the Wi-Fi restore, which is re-activated explicitly. Cosmetic.
+5. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
+6. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
+7. **One global Tokio runtime** at the UniFFI boundary (noted with a `ponytail:` comment): all adapters share one worker pool, so a busy protocol could starve another. Acceptable until Android background-transfer load proves otherwise; then per-adapter executors.
 
 ---
 

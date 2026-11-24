@@ -179,3 +179,46 @@ async fn sender_cleans_up_when_ble_fails() {
         "P2P group survived a failed send:\n{interface}"
     );
 }
+
+/// The Wi-Fi connection that was active before the send must be back after
+/// the group is torn down.
+///
+/// NM's `Device.disconnect()` is a user-requested disconnect: it sets the
+/// device's autoconnect block, so NM never reconnects on its own. The
+/// sender therefore has to remember the profile and re-activate it.
+#[tokio::test]
+#[ignore = "requires root and a real Wi-Fi adapter"]
+async fn sender_restores_wifi_after_the_group_is_torn_down() {
+    let client = NmClient::new().await.expect("NM client");
+
+    let Some((_, profile_id)) = client.active_wifi_profile("wlan0").await.expect("profile")
+    else {
+        panic!("wlan0 has no active WiFi connection; connect to one first");
+    };
+    println!("BEFORE profile={profile_id:?}");
+
+    let sender = WiFiP2pSender::with_config(P2pConfig {
+        interface: "wlan0".to_string(),
+        ssid_prefix: "DIRECT-".to_string(),
+        use_5ghz: false,
+    });
+
+    sender.create_group(8443).await.expect("sender group");
+    sender.stop_group().await.expect("stop sender group");
+
+    // Give NetworkManager a moment to finish the activation.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let restored = client
+        .active_wifi_profile("wlan0")
+        .await
+        .expect("restored profile")
+        .map(|(_, id)| id);
+
+    println!("AFTER profile={restored:?}");
+    assert_eq!(
+        restored.as_deref(),
+        Some(profile_id.as_str()),
+        "the WiFi connection was not restored after the P2P group was torn down"
+    );
+}
