@@ -1,7 +1,7 @@
 # Satella — State of the Project
 
 **Stage:** v0.1.0, greenfield init complete and verified, committed.
-**Last live verification:** 2026-11-24 — unprivileged helper-path GO probes; 2026-11-23 — MTA send and receive against a OnePlus 13.
+**Last live verification:** 2026-11-24 — unprivileged sudo-less helper path re-verified end to end (no outer `pkexec`, no password prompt, stable user identity); 2026-11-23 — MTA send and receive against a OnePlus 13.
 
 ---
 
@@ -48,6 +48,7 @@ cargo doc --workspace --no-deps                         ✅
 - Forced-failure run (ghost BLE peer): group, DHCP and address all cleaned up. Probe `sender_cleans_up_when_ble_fails` asserts this.
 - Unprivileged helper path (2026-11-24): built and installed `satella-mta-helper` plus the polkit action/rule; ran `sender_create_group_integration` and `sender_cleans_up_when_ble_fails` as user `lee` with `SATELLA_MTA_HELPER=/usr/libexec/satella-mta-helper`, no outer `pkexec` and no password prompt. Both passed; no dnsmasq, GO address, P2P-GO or pid file survived. A full CLI send against the phone was not re-run in this session: discovery saw 0 BLE devices (phone not advertising), so the phone-side leg still rests on the 2026-11-23 evidence.
 - In-process backend (2026-11-24): `sender_create_group_integration` under `pkexec` also passed, so the root/probe path survived the backend refactor and cleaned up the same way.
+- Re-verification of the sudo-less path (2026-11-24, independent of the implementing session): as uid 1000, with no outer `pkexec`, `sender_create_group_integration` and `sender_cleans_up_when_ble_fails` both passed three times in a row against the installed `/usr/libexec/satella-mta-helper` — no password prompt on any invocation, confirming the permanent `Result.YES` grant. The action resolves to `org.satella.mta.manage-p2p` with `org.freedesktop.policykit.exec.path -> /usr/libexec/satella-mta-helper`, so the grant covers only that binary. The helper refuses to run as non-root, rejects unknown commands, unsafe interface names and out-of-band frequencies (all exit 1), and `destroy` kills only the PID in the root-owned pid file after confirming `/proc/<pid>/comm` is `dnsmasq`. After each run no GO address, dnsmasq, P2P-GO interface or pid file survived. `satella-cli discover` ran unprivileged and reused the existing user-owned `~/.config/satella/mta-identity` (mtime unchanged), so the BLE fingerprint stays stable. The phone-side leg still rests on the 2026-11-23 evidence: discovery saw 0 BLE devices during this session.
 
 **Release artifacts built:** `libsatella.so` (cdylib UniFFI loads), `libsatella.a`, `libsatella.rlib`, plus generated `satella.uniffi.rs` scaffolding.
 
