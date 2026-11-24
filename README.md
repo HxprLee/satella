@@ -81,9 +81,10 @@ is the whole point of the design.
 cargo run -p satella-cli -- discover --seconds 30
 
 # Send files to a peer, found by its fingerprint.
-# MTA sends need a real Wi-Fi Direct group owner, which needs root on Linux;
-# the other protocols work unelevated.
-sudo cargo run -p satella-cli -- send <fingerprint> ./photo.jpg
+# MTA sends use a narrow root helper for the Wi-Fi Direct group owner; install
+# it and the polkit action once (see "Platform notes"), then run unprivileged.
+# The other protocols work unelevated.
+cargo run -p satella-cli -- send <fingerprint> ./photo.jpg
 
 # Accept incoming transfers into a directory
 cargo run -p satella-cli -- receive ./downloads
@@ -113,10 +114,27 @@ cargo doc --workspace --no-deps
 - **Windows** is supported for the LocalSend and Quick Share paths. The MTA
   adapter needs a WinRT BLE implementation, which is not vendored yet.
 
-MTA sending is the one part that needs `sudo`: wpa_supplicant's D-Bus API,
+MTA sending is the one part that needs privilege: wpa_supplicant's D-Bus API,
 which creates the Wi-Fi Direct group owner that Android receivers require, is
-root-only. It also needs `dnsmasq` on `PATH` to hand out addresses inside the
-group. LocalSend and Quick Share need no elevated privileges.
+root-only. The CLI itself stays an ordinary user process. It calls
+`satella-mta-helper` through `pkexec`; the helper performs only the fixed
+create/destroy operations, and the packaged polkit action grants the local
+`wheel` user a permanent authorization so there is no password prompt after
+the one-time install:
+
+```sh
+cargo build -p satella-cli -p satella-mta-helper
+sudo install -m755 target/debug/satella-mta-helper /usr/libexec/satella-mta-helper
+sudo install -m644 packaging/org.satella.mta.policy /usr/share/polkit-1/actions/
+sudo install -m644 packaging/60-satella-mta.rules /etc/polkit-1/rules.d/
+```
+
+`dnsmasq` must be installed to hand out addresses inside the group. Running
+Satella as root still uses the in-process path (and the hardware probes use
+it). A `cargo`-built CLI finds the debug helper next to itself first; set
+`SATELLA_MTA_HELPER=/usr/libexec/satella-mta-helper` to use the installed,
+permanently authorized helper. LocalSend and Quick Share need no elevated
+privileges.
 
 ## License
 

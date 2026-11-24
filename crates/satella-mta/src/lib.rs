@@ -7,8 +7,10 @@
 //! The MTA protocol discovers peers over Bluetooth Low Energy and transfers
 //! the files over a Wi-Fi Direct group, so the adapter needs a working
 //! Bluetooth adapter and a Wi-Fi interface. Receiving goes through BlueZ and
-//! NetworkManager; sending needs root to create the Wi-Fi Direct group owner
-//! through wpa_supplicant, because that D-Bus API is root-only.
+//! NetworkManager; sending creates the Wi-Fi Direct group owner through
+//! wpa_supplicant. That API is root-only, so an ordinary-user process calls
+//! the narrow `satella-mta-helper` instead of elevating the whole CLI. Running
+//! as root (or the hardware probes) uses the in-process path.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -6,6 +6,7 @@ members = [
     "crates/satella-localsend",
     "crates/satella-quickshare",
     "crates/satella-mta",
+    "crates/satella-mta-helper",
     "crates/satella-api",
     "crates/satella-cli",
 ]

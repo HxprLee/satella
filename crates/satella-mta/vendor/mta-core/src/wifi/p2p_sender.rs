@@ -6,13 +6,16 @@
 //!
 //! # 实现方式
 //!
-//! 1. 优先用 `WpaP2pGroupOwner` 创建真正的 P2P 组（需要 root）
-//! 2. 失败时退回 `NmClient` 普通热点：两个 Satella 设备之间仍然可用
+//! 1. 以 root 运行时，用 [`InProcessGroupOwner`] 直接创建真正的 P2P 组
+//! 2. 普通用户运行时，用 [`HelperGroupOwner`] 调用 `satella-mta-helper`；
+//!    它只把建组、配地址、起 DHCP 这些 root-only 操作交给 helper
+//! 3. 两者都失败时退回 `NmClient` 普通热点：两个 Satella 设备之间仍然可用
 //!
 //! # 注意事项
 //!
 //! - P2P 组所有者要 root（wpa_supplicant 的 D-Bus 接口只允许 root）
 //! - 5GHz 频段优先，建组失败再退 2.4GHz
+//! - helper 每次操作跑完就退出，组和 dnsmasq 要继续留在系统里
 
 use std::process::Command;
 use std::sync::Arc;
@@ -24,8 +27,7 @@ use tokio::sync::Mutex;
 use crate::wifi::P2pInfo;
 use crate::wifi::nm_dbus::NmClient;
 use crate::wifi::p2p_go::{
-    DhcpServer, P2pGroup, WpaP2pGroupOwner, configure_go_interface, is_root,
-    remove_go_interface_address,
+    GroupOwnerBackend, HelperGroupOwner, InProcessGroupOwner, P2pGroup, is_root,
 };
 
 /// WiFi P2P 配置
@@ -57,9 +59,8 @@ enum ActiveHotspot {
     },
     /// wpa_supplicant 创建的真正 P2P 组。
     GroupOwner {
-        owner: WpaP2pGroupOwner,
+        backend: Box<dyn GroupOwnerBackend>,
         group: P2pGroup,
-        dhcp: DhcpServer,
     },
 }
 
@@ -149,8 +150,8 @@ impl WiFiP2pSender {
                     );
                 } else {
                     warn!(
-                        "Run satella with sudo or pkexec to let Android receivers join; \
-                         falling back to a plain hotspot that only Satella peers can use"
+                        "Falling back to a plain hotspot that only Satella peers can use; \
+                         install satella-mta-helper to let Android receivers join"
                     );
                 }
             }
@@ -189,15 +190,15 @@ impl WiFiP2pSender {
         Ok(P2pInfo::new(ssid, psk, mac, port))
     }
 
-    /// 用 `wpa_supplicant` 建一个 P2P 组，配好地址并启动 DHCP。
+    /// 用当前可用的后端建一个 P2P 组，配好地址并启动 DHCP。
     async fn create_group_owner(&self) -> anyhow::Result<(String, String)> {
         // NetworkManager 还占着接口的话，它稍后激活别的连接会把组拆掉。
         self.disconnect_from_nm().await;
 
-        let owner = WpaP2pGroupOwner::new(&self.config.interface).await?;
+        let backend = self.group_owner_backend().await?;
 
         let primary = if self.config.use_5ghz { 5745 } else { 2412 };
-        let group = match owner.create_group(primary, Duration::from_secs(20)).await {
+        let group = match backend.create_group(primary).await {
             Ok(group) => group,
             Err(err) => {
                 if !self.config.use_5ghz {
@@ -205,38 +206,35 @@ impl WiFiP2pSender {
                 }
 
                 warn!("P2P group on {primary} MHz failed: {err:#}, retrying on 2412 MHz");
-                owner.create_group(2412, Duration::from_secs(20)).await?
-            }
-        };
-
-        if group.ssid.is_empty() || group.psk.is_empty() {
-            let _ = owner.remove_group().await;
-            return Err(anyhow::anyhow!(
-                "the P2P group has an empty SSID or passphrase"
-            ));
-        }
-
-        if let Err(err) = configure_go_interface(&group.interface).await {
-            let _ = remove_go_interface_address(&group.interface).await;
-            let _ = owner.remove_group().await;
-            return Err(err);
-        }
-
-        let dhcp = match DhcpServer::start(&group.interface).await {
-            Ok(dhcp) => dhcp,
-            Err(err) => {
-                let _ = remove_go_interface_address(&group.interface).await;
-                let _ = owner.remove_group().await;
-                return Err(err);
+                backend.create_group(2412).await?
             }
         };
 
         let ssid = group.ssid.clone();
         let psk = group.psk.clone();
 
-        *self.active_hotspot.lock().await = Some(ActiveHotspot::GroupOwner { owner, group, dhcp });
+        *self.active_hotspot.lock().await = Some(ActiveHotspot::GroupOwner { backend, group });
 
         Ok((ssid, psk))
+    }
+
+    /// 选择创建组所有者的后端。
+    ///
+    /// 已经是 root 时留在进程内，硬件探针的行为不变；普通用户则走 helper，
+    /// 这样 BLE、TLS 和身份文件都留在用户空间。
+    async fn group_owner_backend(&self) -> anyhow::Result<Box<dyn GroupOwnerBackend>> {
+        if is_root() {
+            return Ok(Box::new(
+                InProcessGroupOwner::new(&self.config.interface).await?,
+            ));
+        }
+
+        match HelperGroupOwner::new(&self.config.interface) {
+            Ok(backend) => Ok(Box::new(backend)),
+            Err(err) => Err(anyhow::anyhow!(
+                "{err}; run Satella as root if the helper is not installed"
+            )),
+        }
     }
 
     /// 让 NetworkManager 松开接口。
@@ -353,22 +351,9 @@ impl WiFiP2pSender {
                     }
                 }
             }
-            Some(ActiveHotspot::GroupOwner { owner, group, dhcp }) => {
-                let _ = dhcp.stop().await;
-
-                let mut first_error = None;
-
-                if let Err(err) = owner.remove_group().await {
-                    first_error = Some(err);
-                }
-
-                if let Err(err) = remove_go_interface_address(&group.interface).await
-                    && first_error.is_none()
-                {
-                    first_error = Some(err);
-                }
-
-                if let Some(err) = first_error {
+            Some(ActiveHotspot::GroupOwner { backend, group }) => {
+                debug!("Destroying the P2P group on {}", group.interface);
+                if let Err(err) = backend.destroy_group().await {
                     return Err(err);
                 }
             }

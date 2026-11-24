@@ -1,7 +1,7 @@
 # Satella — State of the Project
 
 **Stage:** v0.1.0, greenfield init complete and verified, committed.
-**Last live verification:** 2026-11-23 — MTA send and receive against a OnePlus 13.
+**Last live verification:** 2026-11-24 — unprivileged helper-path GO probes; 2026-11-23 — MTA send and receive against a OnePlus 13.
 
 ---
 
@@ -14,6 +14,7 @@
 | `satella-localsend` | LocalSend v2 adapter (vendored engine, 560K). | 922 |
 | `satella-quickshare` | Quick Share adapter (vendored engine, 336K). | 370 |
 | `satella-mta` | MTA adapter (vendored engine, 244K). | 395 |
+| `satella-mta-helper` | Narrow Linux helper: fixed `create`/`destroy` for the P2P GO. | 282 |
 | `satella-api` | The public UniFFI surface (`satella.udl`). | 477 |
 | `satella-cli` | Terminal harness: discover / send / receive. | 344 |
 
@@ -45,6 +46,8 @@ cargo doc --workspace --no-deps                         ✅
 - Real MTA send end to end against the same phone: wpa_supplicant group owner on 5 GHz (`DIRECT-gu`), DHCP on 192.168.49.0/24, BLE `P2pInfo`, phone joined, WSS `sendRequest`, ZIP download, status OK. Group, DHCP and address cleaned up afterwards.
 - Repeated sends: 2 files and 1 file, both OK (`/tmp/opencode/send-go-5.log`, `/tmp/opencode/send-go-6.log`; `/tmp` is ephemeral).
 - Forced-failure run (ghost BLE peer): group, DHCP and address all cleaned up. Probe `sender_cleans_up_when_ble_fails` asserts this.
+- Unprivileged helper path (2026-11-24): built and installed `satella-mta-helper` plus the polkit action/rule; ran `sender_create_group_integration` and `sender_cleans_up_when_ble_fails` as user `lee` with `SATELLA_MTA_HELPER=/usr/libexec/satella-mta-helper`, no outer `pkexec` and no password prompt. Both passed; no dnsmasq, GO address, P2P-GO or pid file survived. A full CLI send against the phone was not re-run in this session: discovery saw 0 BLE devices (phone not advertising), so the phone-side leg still rests on the 2026-11-23 evidence.
+- In-process backend (2026-11-24): `sender_create_group_integration` under `pkexec` also passed, so the root/probe path survived the backend refactor and cleaned up the same way.
 
 **Release artifacts built:** `libsatella.so` (cdylib UniFFI loads), `libsatella.a`, `libsatella.rlib`, plus generated `satella.uniffi.rs` scaffolding.
 
@@ -63,16 +66,17 @@ Sequence:
 2. `TransferServer::start_tls()` binds `0.0.0.0:0` and serves `/websocket` and
    `/download` on the same port with a fresh self-signed certificate. CatShare
    connects with `wss://` and `https://`, so plain HTTP does not work.
-3. `WiFiP2pSender::create_group`:
-   - asks NetworkManager to release `wlan0`;
-   - `WpaP2pGroupOwner::new` connects to `fi.w1.wpa_supplicant1` and sets
-     `NoGroupIface=true`;
-   - `GroupAdd` on 5745 MHz, retry on 2412 MHz; reads SSID, PSK and frequency
-     from the group object;
-   - `ip addr replace 192.168.49.1/24 dev wlan0`, `ip link set wlan0 up`;
-   - starts `dnsmasq` for 192.168.49.2–254, gateway/DNS 192.168.49.1.
-   - if any of this fails, it falls back to a NetworkManager hotspot. That
-     keeps Satella↔Satella working but Android cannot join it.
+3. `WiFiP2pSender::create_group` asks NetworkManager to release `wlan0`, then
+   picks a `GroupOwnerBackend`:
+   - as root, `InProcessGroupOwner` talks to `fi.w1.wpa_supplicant1` directly,
+     sets `NoGroupIface=true`, calls `GroupAdd`, configures the address and
+     starts `dnsmasq`;
+   - as an ordinary user, `HelperGroupOwner` calls `satella-mta-helper` once
+     through `pkexec`. The helper does the same root-only steps and prints the
+     group as JSON. The helper exits; the P2P group and `dnsmasq` keep running.
+   Both try 5745 MHz, then 2412 MHz. If all of this fails, the sender falls
+   back to a NetworkManager hotspot. That keeps Satella↔Satella working but
+   Android cannot join it.
 4. `BleClient::connect_and_handshake_named` finds the phone by address, then a
    5 s scan, then a unique local name; connects with retries, reads the
    receiver's `DeviceInfo`, derives the ECDH session key, encrypts `P2pInfo`
@@ -90,8 +94,11 @@ Sequence:
 
 | File | Role |
 |---|---|
-| `crates/satella-mta/vendor/mta-core/src/wifi/p2p_go.rs` | wpa_supplicant D-Bus GO, IP configuration, dnsmasq lifecycle, privilege escalation. |
-| `crates/satella-mta/vendor/mta-core/src/wifi/p2p_sender.rs` | GO-first `create_group`, NetworkManager fallback, `ActiveHotspot` enum, `stop_group`, `DIRECT-xx` SSID. |
+| `crates/satella-mta/vendor/mta-core/src/wifi/p2p_go.rs` | wpa_supplicant D-Bus GO, IP configuration, dnsmasq lifecycle, `GroupOwnerBackend`, in-process and helper backends. |
+| `crates/satella-mta/vendor/mta-core/src/wifi/p2p_sender.rs` | GO-first `create_group`, backend selection, NetworkManager fallback, `ActiveHotspot` enum, `stop_group`, `DIRECT-xx` SSID. |
+| `crates/satella-mta-helper/src/main.rs` | Narrow root helper: fixed `create`/`destroy`, interface/frequency validation, JSON output, one operation per process. |
+| `packaging/org.satella.mta.policy` | Dedicated polkit action bound to `/usr/libexec/satella-mta-helper`. |
+| `packaging/60-satella-mta.rules` | Permanent `polkit.Result.YES` for local `wheel`, so later sends never prompt. |
 | `crates/satella-mta/vendor/mta-core/src/workflow/sender.rs` | TLS server, GO creation, BLE handshake, status wait, guaranteed cleanup. |
 | `crates/satella-mta/vendor/mta-core/src/ble/client.rs` | Address scan, unique-name fallback, connect/read/write retries. |
 | `crates/satella-mta/vendor/mta-core/src/transfer/sender_server.rs` | TLS axum server, `/websocket` protocol, ZIP `/download`. |
@@ -102,14 +109,25 @@ Sequence:
 ### Running a live send
 
 ```sh
-cargo build -p satella-cli
+cargo build -p satella-cli -p satella-mta-helper
+
+# One-time install (needs root once). The installed helper path is what the
+# polkit action authorizes; after this the rule grants it permanently.
+id -nG   # the rule requires the local user to be in wheel
+sudo install -m755 target/debug/satella-mta-helper /usr/libexec/satella-mta-helper
+sudo install -m644 packaging/org.satella.mta.policy /usr/share/polkit-1/actions/
+sudo install -m644 packaging/60-satella-mta.rules /etc/polkit-1/rules.d/
 
 # The phone must be on its CatShare receive screen first.
 ./target/debug/satella-cli discover --seconds 15
 
-# pkexec works on this machine; sudo -n does not (password required).
-timeout 180 pkexec /usr/bin/bash -c \
-  'cd /home/lee/Projects/satella && RUST_LOG=info,satella_mta=info,satella_mta_vendor::wifi=debug,satella_mta_vendor::transfer=debug,satella_mta_vendor::ble=debug ./target/debug/satella-cli send <fingerprint-or-any> <file>...'
+# No outer pkexec: the CLI stays a user process and invokes the helper itself.
+# The debug helper next to the CLI takes precedence over /usr/libexec, so pin
+# the installed one to get the permanent (no-prompt) polkit grant:
+timeout 180 env \
+  SATELLA_MTA_HELPER=/usr/libexec/satella-mta-helper \
+  RUST_LOG=info,satella_mta=info,satella_mta_vendor::wifi=debug,satella_mta_vendor::transfer=debug,satella_mta_vendor::ble=debug \
+  ./target/debug/satella-cli send <fingerprint-or-any> <file>...
 
 # Success markers in the log:
 #   Created the P2P group DIRECT-xx on channel 5745
@@ -127,21 +145,29 @@ iw dev wlan0 info | grep type     # no P2P-GO
 nmcli connection up "Mr Breast"   # local Wi-Fi profile on this machine
 ```
 
-Running the whole CLI under `pkexec` means the identity is
-`/root/.config/satella/mta-identity`; unprivileged runs use
-`~/.config/satella/mta-identity`. The fingerprints differ between the two, so
-an elevated run is a new device to peers.
+Normal runs keep the identity at `~/.config/satella/mta-identity`; the old
+`/root/.config/satella/mta-identity` from whole-CLI elevations is obsolete.
+The helper path is chosen as `SATELLA_MTA_HELPER`, then next to the running
+binary (including `target/debug` for tests in `deps`), then
+`/usr/libexec/satella-mta-helper`. Without the polkit rule, `pkexec` asks for
+authorization once per helper invocation (`create` and `destroy`); with the
+rule installed it never asks.
 
 ### Hardware probes
 
 ```sh
 cargo test -p satella-mta-vendor --test p2p_go_probe --no-run
-# Run the reported binary (keep the ./ for pkexec):
-timeout 120 pkexec ./target/debug/deps/p2p_go_probe-<hash> --ignored --nocapture
-# Or one case:
-timeout 120 pkexec ./target/debug/deps/p2p_go_probe-<hash> \
-  sender_cleans_up_when_ble_fails --ignored --nocapture
+PROBE=./target/debug/deps/p2p_go_probe-<hash>
+
+# Sender cases as an ordinary user exercise HelperGroupOwner (helper installed):
+timeout 120 $PROBE sender_create_group_integration --ignored --nocapture
+timeout 120 $PROBE sender_cleans_up_when_ble_fails --ignored --nocapture
+
+# The raw D-Bus case has no helper wrapper, so it still needs root:
+timeout 120 pkexec $PROBE p2p_go_starts_and_serves_dhcp --ignored --nocapture
 ```
+
+Running a sender case under `pkexec` instead exercises the in-process backend.
 
 Cases:
 
@@ -160,8 +186,15 @@ hide a cleanup regression.
 - **Do not replace the GO with the NetworkManager hotspot.** NM can only make
   `mode=ap`; Android never joins it. The NM path is a Satella↔Satella fallback.
 - **wpa_supplicant D-Bus is root-only.** On this machine a plain user gets
-  `Access denied` from `fi.w1.wpa_supplicant1`. `pkexec` is the working
-  escalation; `sudo -n` fails.
+  `Access denied` from `fi.w1.wpa_supplicant1`. That is why ordinary-user
+  sends go through `satella-mta-helper`; `pkexec` is the working escalation and
+  `sudo -n` fails. Do not open the whole wpa_supplicant D-Bus API to users.
+- **The polkit action is bound to `/usr/libexec/satella-mta-helper`.** A dev
+  build in `target/debug` works through generic `pkexec` but prompts each time;
+  only the installed path gets the permanent `Result.YES` rule.
+- **The helper's pid file is the kill authority.** `destroy --dhcp-pid` is only
+  a consistency check. Never kill a caller-supplied pid; read
+  `/run/satella-mta/dnsmasq-<iface>.pid` and verify `/proc/<pid>/comm` first.
 - **`NoGroupIface=true` is required** on iwlwifi; otherwise the separate group
   interface fails with `Failed to set P2P Mode: ret=-95`.
 - **Android BLE addresses rotate.** The scanner's fingerprint can be stale by
@@ -199,7 +232,7 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 ## Known gaps
 
 1. **Quick Share transfer leg is unverified.** Its `send`/`accept`/`reject` are fully implemented (no `todo!()`/`unimplemented!()` anywhere), and discovery is confirmed — but a real file transfer has not been exercised. This is the obvious next target.
-2. **MTA sending needs root on Linux.** Android receivers only join a real Wi-Fi Direct group owner, and wpa_supplicant's D-Bus API is root-only. The CLI must run under `sudo`/`pkexec` for MTA sends; LocalSend and Quick Share stay unelevated. A privileged helper is the likely packaging fix: grant only `GroupAdd` / `Disconnect`, `ip addr`, and `dnsmasq`, keep the app unprivileged. The elevated run currently also switches the identity to `/root/.config/satella/mta-identity`.
+2. **MTA sending needs a one-time Linux helper install.** Android receivers only join a real Wi-Fi Direct group owner, and wpa_supplicant's D-Bus API is root-only. The privileged operations now live in `satella-mta-helper` plus a packaged polkit action, so the CLI stays unprivileged and keeps `~/.config/satella/mta-identity`. Without that install, MTA send still needs the whole CLI under `sudo`/`pkexec`, or it falls back to the Satella-only NetworkManager hotspot. Distro packaging for the helper/policy files is still manual.
 3. **mDNS/LocalSend error spam while `wlan0` is a GO.** Sockets still point at the previous address and log “Network is unreachable”. Cosmetic; suppress or rebind while the GO is up.
 4. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
 5. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
@@ -212,5 +245,7 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 - `README.md` — scope, crate layout, UniFFI contract, CLI usage, platform notes, license origins.
 - `docs/designs/satella-init.md` — the finalized design: why one trait instead of four, why the protocol lives on the peer, why GPL-3.0 is forced, the verification strategy, and the four bugs the init uncovered.
 - `crates/satella-mta/THIRD_PARTY_NOTICES.md` — fork provenance plus every change made to the vendored MTA engine, for rebases.
-- `crates/satella-mta/vendor/mta-core/src/wifi/p2p_go.rs` — module docs explain why D-Bus, why root, and why `NoGroupIface`.
+- `crates/satella-mta/vendor/mta-core/src/wifi/p2p_go.rs` — module docs explain why D-Bus, why root, and why `NoGroupIface`; the backend trait isolates the privileged transport.
+- `crates/satella-mta-helper/` — the fixed-purpose root helper and its JSON protocol.
+- `packaging/` — the polkit action and permanent rule installed by the runbook.
 - `crates/satella-mta/vendor/mta-core/tests/p2p_go_probe.rs` — executable form of the runbook above.

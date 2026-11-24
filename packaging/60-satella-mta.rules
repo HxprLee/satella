@@ -1,0 +1,11 @@
+// Allow the local administrator to manage the Satella MTA P2P group
+// without a password prompt. The action is bound to
+// /usr/libexec/satella-mta-helper by org.freedesktop.policykit.exec.path,
+// so this does not allow running arbitrary programs as root.
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.satella.mta.manage-p2p" &&
+        subject.isInGroup("wheel") &&
+        subject.local) {
+        return polkit.Result.YES;
+    }
+});

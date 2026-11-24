@@ -26,8 +26,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use zbus::zvariant::{OwnedValue, Value};
 
 /// wpa_supplicant 的 D-Bus 服务名。
@@ -62,6 +65,18 @@ pub struct P2pGroup {
     pub interface: String,
     /// 组的频率（MHz）。
     pub frequency: u32,
+}
+
+/// `satella-mta-helper create` 的 JSON 输出。
+///
+/// 父进程和 helper 共用这个定义，避免两边字段名漂移。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelperGroupInfo {
+    pub ssid: String,
+    pub psk: String,
+    pub interface: String,
+    pub frequency: u32,
+    pub dhcp_pid: u32,
 }
 
 /// 用 `wpa_supplicant` 的 D-Bus 接口创建一个 P2P 组。
@@ -245,6 +260,313 @@ impl WpaP2pGroupOwner {
     }
 }
 
+/// 创建/销毁 P2P 组所需要的那一小部分特权操作。
+///
+/// Linux 上有两个实现：已经以 root 运行时直接在进程内和 `wpa_supplicant`
+/// 说话（[`InProcessGroupOwner`]）；普通用户运行时调用一次性的
+/// [`HelperGroupOwner`]。将来的 Windows/macOS 后端只要实现这个 trait，
+/// 发送流程就不用跟着改。
+#[async_trait]
+pub trait GroupOwnerBackend: Send + Sync {
+    /// 在指定频率上创建组，并配好地址和 DHCP。
+    async fn create_group(&self, frequency: u32) -> anyhow::Result<P2pGroup>;
+
+    /// 拆掉组、停掉 DHCP，并去掉地址。
+    async fn destroy_group(&self) -> anyhow::Result<()>;
+}
+
+/// 已经以 root 运行时使用的后端。
+pub struct InProcessGroupOwner {
+    owner: WpaP2pGroupOwner,
+    state: Mutex<Option<InProcessGroupState>>,
+}
+
+struct InProcessGroupState {
+    group: P2pGroup,
+    dhcp: DhcpServer,
+}
+
+impl InProcessGroupOwner {
+    /// 连接到 `wpa_supplicant`，准备在 `interface` 上建组。
+    pub async fn new(interface: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            owner: WpaP2pGroupOwner::new(interface).await?,
+            state: Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait]
+impl GroupOwnerBackend for InProcessGroupOwner {
+    async fn create_group(&self, frequency: u32) -> anyhow::Result<P2pGroup> {
+        let has_state = { self.state.lock().await.is_some() };
+        if has_state {
+            self.destroy_group().await?;
+        }
+
+        let group = self
+            .owner
+            .create_group(frequency, Duration::from_secs(20))
+            .await?;
+
+        if group.ssid.is_empty() || group.psk.is_empty() {
+            let _ = self.owner.remove_group().await;
+            return Err(anyhow::anyhow!(
+                "the P2P group has an empty SSID or passphrase"
+            ));
+        }
+
+        if let Err(err) = configure_go_interface(&group.interface).await {
+            let _ = self.owner.remove_group().await;
+            return Err(err);
+        }
+
+        let dhcp = match DhcpServer::start(&group.interface).await {
+            Ok(dhcp) => dhcp,
+            Err(err) => {
+                let _ = remove_go_interface_address(&group.interface).await;
+                let _ = self.owner.remove_group().await;
+                return Err(err);
+            }
+        };
+
+        *self.state.lock().await = Some(InProcessGroupState {
+            group: group.clone(),
+            dhcp,
+        });
+
+        Ok(group)
+    }
+
+    async fn destroy_group(&self) -> anyhow::Result<()> {
+        let Some(state) = self.state.lock().await.take() else {
+            return Ok(());
+        };
+
+        let mut first_error = None;
+        if let Err(err) = state.dhcp.stop().await {
+            first_error = Some(err);
+        }
+        if let Err(err) = self.owner.remove_group().await
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+        if let Err(err) = remove_go_interface_address(&state.group.interface).await
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 普通用户运行时使用的后端：每次操作调用一次 `satella-mta-helper`。
+///
+/// helper 跑完就退出；P2P 组和 `dnsmasq` 留在系统里，所以父进程不能在
+/// helper 退出后就认为组没了。
+pub struct HelperGroupOwner {
+    interface: String,
+    helper: PathBuf,
+    state: Mutex<Option<HelperGroupInfo>>,
+}
+
+impl HelperGroupOwner {
+    /// 找到 helper，准备用它管理 `interface` 上的组。
+    pub fn new(interface: &str) -> anyhow::Result<Self> {
+        let helper = resolve_helper_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find satella-mta-helper (set SATELLA_MTA_HELPER, build it next to \
+                 satella-cli, or install it in /usr/libexec)"
+            )
+        })?;
+
+        Ok(Self {
+            interface: interface.to_owned(),
+            helper,
+            state: Mutex::new(None),
+        })
+    }
+
+    async fn destroy_info(&self, info: &HelperGroupInfo) -> anyhow::Result<()> {
+        let args = vec![
+            "destroy".to_owned(),
+            "--iface".to_owned(),
+            info.interface.clone(),
+            "--dhcp-pid".to_owned(),
+            info.dhcp_pid.to_string(),
+        ];
+
+        run_privileged(&self.helper.display().to_string(), &args).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GroupOwnerBackend for HelperGroupOwner {
+    async fn create_group(&self, frequency: u32) -> anyhow::Result<P2pGroup> {
+        let has_state = { self.state.lock().await.is_some() };
+        if has_state {
+            self.destroy_group().await?;
+        }
+
+        let args = vec![
+            "create".to_owned(),
+            "--iface".to_owned(),
+            self.interface.clone(),
+            "--freq".to_owned(),
+            frequency.to_string(),
+        ];
+
+        let stdout = run_privileged(&self.helper.display().to_string(), &args).await?;
+        let info: HelperGroupInfo = serde_json::from_str(stdout.trim()).map_err(|err| {
+            anyhow::anyhow!(
+                "satella-mta-helper returned invalid JSON ({err}): {}",
+                stdout.trim()
+            )
+        })?;
+
+        validate_interface_name(&info.interface)?;
+
+        if info.ssid.is_empty() || info.psk.is_empty() {
+            let _ = self.destroy_info(&info).await;
+            return Err(anyhow::anyhow!(
+                "satella-mta-helper returned an empty SSID or passphrase"
+            ));
+        }
+        validate_frequency(info.frequency)?;
+
+        let group = P2pGroup {
+            ssid: info.ssid.clone(),
+            psk: info.psk.clone(),
+            interface: info.interface.clone(),
+            frequency: info.frequency,
+        };
+        *self.state.lock().await = Some(info);
+
+        Ok(group)
+    }
+
+    async fn destroy_group(&self) -> anyhow::Result<()> {
+        let Some(info) = self.state.lock().await.take() else {
+            return Ok(());
+        };
+
+        self.destroy_info(&info).await
+    }
+}
+
+/// helper 的文件名。
+const HELPER_NAME: &str = "satella-mta-helper";
+
+/// 找到 `satella-mta-helper`。
+///
+/// 顺序：`SATELLA_MTA_HELPER`、当前可执行文件旁边（`cargo test` 时再上一层
+/// 的 `deps`）、最后是打包安装的 `/usr/libexec`。
+fn resolve_helper_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SATELLA_MTA_HELPER") {
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            match std::env::current_dir() {
+                Ok(directory) => directory.join(path),
+                Err(err) => {
+                    warn!(
+                        "SATELLA_MTA_HELPER is relative and the current directory is unknown: {err}"
+                    );
+                    return None;
+                }
+            }
+        };
+
+        if is_executable(&path) {
+            return Some(path);
+        }
+        warn!(
+            "SATELLA_MTA_HELPER={} is not an executable file",
+            path.display()
+        );
+    }
+
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        let candidate = parent.join(HELPER_NAME);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+
+        // `cargo test` 从 `target/debug/deps` 跑，helper 在上一层。
+        if parent.file_name().is_some_and(|name| name == "deps")
+            && let Some(parent) = parent.parent()
+        {
+            let candidate = parent.join(HELPER_NAME);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let installed = PathBuf::from("/usr/libexec").join(HELPER_NAME);
+    if is_executable(&installed) {
+        return Some(installed);
+    }
+
+    None
+}
+
+/// 文件存在且带可执行位。
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// helper 只接受这样的接口名：`wlan*` 或 `p2p-*`，最长 15 字节。
+pub fn validate_interface_name(interface: &str) -> anyhow::Result<()> {
+    if interface.is_empty() || interface.len() > 15 {
+        return Err(anyhow::anyhow!(
+            "interface name must be 1-15 bytes, got {interface:?}"
+        ));
+    }
+
+    if !(interface.starts_with("wlan") || interface.starts_with("p2p-")) {
+        return Err(anyhow::anyhow!(
+            "interface {interface:?} must start with wlan or p2p-"
+        ));
+    }
+
+    let safe_characters = interface
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+
+    if !safe_characters || interface.contains("..") || interface.starts_with('.') {
+        return Err(anyhow::anyhow!(
+            "interface {interface:?} contains unsafe characters"
+        ));
+    }
+
+    Ok(())
+}
+
+/// helper 只接受 2.4 GHz 和 5 GHz 的信道。
+pub fn validate_frequency(frequency: u32) -> anyhow::Result<()> {
+    if (2400..=2500).contains(&frequency) || (4900..=5900).contains(&frequency) {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "frequency {frequency} MHz is outside the 2.4 GHz and 5 GHz Wi-Fi bands"
+    ))
+}
+
 /// 给组所有者的接口配上互传联盟的地址。
 ///
 /// P2P 组建立以后 `wpa_supplicant` 可能重置接口，所以地址要在组起来之后再配。
@@ -279,10 +601,12 @@ pub async fn configure_go_interface(interface: &str) -> anyhow::Result<()> {
 }
 
 /// 去掉组所有者接口上的地址。
+///
+/// 地址已经不在时也算成功：清理代码会在失败路径上重复调用它。
 pub async fn remove_go_interface_address(interface: &str) -> anyhow::Result<()> {
     let address = format!("{GO_ADDRESS}/{GO_PREFIX_LENGTH}");
 
-    run_privileged(
+    match run_privileged(
         "ip",
         &[
             "addr".to_owned(),
@@ -292,9 +616,21 @@ pub async fn remove_go_interface_address(interface: &str) -> anyhow::Result<()> 
             interface.to_owned(),
         ],
     )
-    .await?;
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if is_absent_link_error(&err) => {
+            debug!("{GO_ADDRESS}/{GO_PREFIX_LENGTH} is already absent from {interface}");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
 
-    Ok(())
+/// `ip` 是不是在说“这个地址/接口本来就没了”？
+fn is_absent_link_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("Cannot assign requested address") || message.contains("Cannot find device")
 }
 
 /// 组所有者上的 DHCP 服务器。
@@ -303,20 +639,14 @@ pub async fn remove_go_interface_address(interface: &str) -> anyhow::Result<()> 
 /// 再用网关地址 `192.168.49.1` 连我们的 HTTPS 服务器。没有 DHCP，接收端
 /// 会一直停在“正在连接”。
 pub struct DhcpServer {
-    pid_file: PathBuf,
     interface: String,
+    pid: u32,
 }
 
 impl DhcpServer {
     /// 在接口上启动 `dnsmasq`，只做 DHCP，不做 DNS。
     pub async fn start(interface: &str) -> anyhow::Result<Self> {
-        let directory = runtime_directory();
-        std::fs::create_dir_all(&directory).map_err(|err| {
-            anyhow::anyhow!(
-                "could not create the runtime directory {}: {err}",
-                directory.display()
-            )
-        })?;
+        let directory = runtime_directory()?;
 
         let pid_file = directory.join(format!("dnsmasq-{interface}.pid"));
         let _ = std::fs::remove_file(&pid_file);
@@ -343,14 +673,22 @@ impl DhcpServer {
         // dnsmasq 会先 fork 再写 pid 文件，等它真的起来。
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(pid) = std::fs::read_to_string(&pid_file)
-                && !pid.trim().is_empty()
-            {
-                info!("Started DHCP on {interface} (dnsmasq pid {})", pid.trim());
-                return Ok(Self {
-                    pid_file,
-                    interface: interface.to_owned(),
-                });
+            if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                let contents = contents.trim();
+                if !contents.is_empty() {
+                    let pid: u32 = contents.parse().map_err(|err| {
+                        anyhow::anyhow!(
+                            "dnsmasq wrote an invalid pid {contents:?} to {}: {err}",
+                            pid_file.display()
+                        )
+                    })?;
+
+                    info!("Started DHCP on {interface} (dnsmasq pid {pid})");
+                    return Ok(Self {
+                        interface: interface.to_owned(),
+                        pid,
+                    });
+                }
             }
 
             if Instant::now() >= deadline {
@@ -364,24 +702,85 @@ impl DhcpServer {
         }
     }
 
+    /// `dnsmasq` 的进程号。
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// 停掉 DHCP 服务器。
     pub async fn stop(&self) -> anyhow::Result<()> {
-        let pid = std::fs::read_to_string(&self.pid_file)
-            .map(|pid| pid.trim().to_owned())
-            .unwrap_or_default();
+        Self::stop_pid(&self.interface, Some(self.pid)).await
+    }
 
-        if !pid.is_empty() {
-            if let Err(err) = run_privileged("kill", &[pid.clone()]).await {
-                warn!(
-                    "could not stop dnsmasq (pid {pid}) on {}: {err}",
-                    self.interface
+    /// 按 root 拥有的 pid 文件停掉接口上的 `dnsmasq`。
+    ///
+    /// `expected_pid` 只用来发现调用方拿错了数字：真正被杀的 PID 永远来自
+    /// pid 文件，所以调用方没法借这个接口去杀别的进程。文件不存在、内容
+    /// 坏掉、或者 PID 已经不是 `dnsmasq` 时都直接跳过，这样清理是幂等的。
+    pub async fn stop_pid(interface: &str, expected_pid: Option<u32>) -> anyhow::Result<()> {
+        let directory = runtime_directory()?;
+        let pid_file = directory.join(format!("dnsmasq-{interface}.pid"));
+
+        let contents = match std::fs::read_to_string(&pid_file) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                debug!(
+                    "No DHCP pid file at {}; nothing to stop",
+                    pid_file.display()
                 );
+                return Ok(());
             }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "could not read the DHCP pid file {}: {err}",
+                    pid_file.display()
+                ));
+            }
+        };
+
+        let pid: u32 = match contents.trim().parse() {
+            Ok(pid) => pid,
+            Err(err) => {
+                warn!(
+                    "Ignoring the malformed DHCP pid file {}: {err}",
+                    pid_file.display()
+                );
+                let _ = std::fs::remove_file(&pid_file);
+                return Ok(());
+            }
+        };
+
+        if let Some(expected) = expected_pid
+            && expected != pid
+        {
+            warn!("DHCP pid file says {pid}, caller expected {expected}; using the pid file");
         }
 
-        let _ = std::fs::remove_file(&self.pid_file);
+        if !is_dnsmasq(pid) {
+            warn!(
+                "PID {pid} from {} is not dnsmasq; removing the stale pid file",
+                pid_file.display()
+            );
+            let _ = std::fs::remove_file(&pid_file);
+            return Ok(());
+        }
+
+        if let Err(err) = run_privileged("kill", &[pid.to_string()]).await {
+            warn!("could not stop dnsmasq (pid {pid}) on {interface}: {err}");
+        }
+
+        let _ = std::fs::remove_file(&pid_file);
         Ok(())
     }
+}
+
+/// 这个 PID 现在还是不是 `dnsmasq`？
+///
+/// `/proc` 读不到时按“不是”处理：宁可留下一个进程，也不误杀别的程序。
+fn is_dnsmasq(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "dnsmasq")
+        .unwrap_or(false)
 }
 
 /// 运行一个需要 root 的命令。
@@ -479,13 +878,62 @@ fn resolve_program(program: &str) -> String {
 }
 
 /// 放 pid 文件的目录。
-fn runtime_directory() -> PathBuf {
+///
+/// root 下必须落在 `/run`：那个目录 root 拥有、`0700`，pid 文件才可信。
+/// 普通用户创建组时不会走到 DHCP（组所有者本来就要求 root），但如果真
+/// 走到这里，仍然允许退回临时目录。
+fn runtime_directory() -> anyhow::Result<PathBuf> {
     let preferred = PathBuf::from("/run/satella-mta");
-    if std::fs::create_dir_all(&preferred).is_ok() {
-        return preferred;
+    match std::fs::create_dir_all(&preferred) {
+        Ok(()) => {
+            if is_root() {
+                harden_runtime_directory(&preferred)?;
+            }
+            return Ok(preferred);
+        }
+        Err(err) if is_root() => {
+            return Err(anyhow::anyhow!(
+                "could not create the runtime directory {}: {err}",
+                preferred.display()
+            ));
+        }
+        Err(_) => {}
     }
 
-    std::env::temp_dir().join("satella-mta")
+    let fallback = std::env::temp_dir().join("satella-mta");
+    std::fs::create_dir_all(&fallback).map_err(|err| {
+        anyhow::anyhow!(
+            "could not create the runtime directory {}: {err}",
+            fallback.display()
+        )
+    })?;
+    Ok(fallback)
+}
+
+/// 确保 root 用的运行目录只属于 root。
+fn harden_runtime_directory(directory: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() {
+        return Err(anyhow::anyhow!(
+            "{} is not a directory",
+            directory.display()
+        ));
+    }
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+
+    let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("{} contains a NUL byte", directory.display()))?;
+    // SAFETY: `path` is a valid NUL-terminated string and `chown` does not keep
+    // the pointer after it returns.
+    if unsafe { libc::chown(path.as_ptr(), 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    Ok(())
 }
 
 /// 在 `Interfaces` 属性里找到名为 `interface` 的那个对象路径。

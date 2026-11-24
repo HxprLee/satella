@@ -3846,6 +3846,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "satella-mta-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "satella-mta-vendor",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "satella-mta-vendor"
 version = "0.1.0"
 dependencies = [

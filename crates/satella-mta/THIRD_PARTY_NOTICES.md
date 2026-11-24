@@ -41,6 +41,15 @@ This crate contains code forked from [Tinnci/cattysend].
 * `vendor/mta-core/src/workflow/receiver.rs` and
   `vendor/mta-core/src/workflow/sender.rs`: both workflows take an optional
   path for the persistent identity.
+* `vendor/mta-core/src/wifi/p2p_go.rs`: the privileged transport is now behind
+  the `GroupOwnerBackend` trait. `InProcessGroupOwner` keeps the original
+  in-process wpa_supplicant path when Satella runs as root;
+  `HelperGroupOwner` calls the narrow `satella-mta-helper` binary when it runs
+  as an ordinary user. The DHCP pid file is treated as the only authority for
+  which process to stop, and `/run/satella-mta` is hardened to root-only when
+  the helper creates it.
+* `vendor/mta-core/src/wifi/p2p_sender.rs`: selects the backend above instead
+  of always talking to wpa_supplicant in-process, and cleans up through it.
 * `vendor/mta-core/src/transfer/sender_server.rs`: the transfer server can
   serve `/websocket` and `/download` over TLS on a single port. The clients
   connect with `wss://` and `https://`, so plain HTTP does not work.
