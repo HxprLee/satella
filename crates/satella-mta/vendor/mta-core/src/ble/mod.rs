@@ -1,70 +1,71 @@
-//! BLE 模块
+//! BLE module
 //!
-//! 提供与 CatShare (Android) 兼容的 BLE 功能。
+//! Provides BLE functionality compatible with CatShare (Android).
 //!
-//! # 模块
+//! # Modules
 //!
-//! - `scanner`: BLE 扫描器（发现接收端设备）
-//! - `client`: BLE 客户端（连接接收端并交换 P2P 信息）
-//! - `server`: GATT 服务器（作为接收端等待连接）
-//! - `advertiser`: 广播器（发布接收端广播）
+//! - `scanner`: BLE scanner (discovers receiver devices)
+//! - `client`: BLE client (connects to the receiver and exchanges P2P info)
+//! - `server`: GATT server (acts as the receiver and waits for connections)
+//! - `advertiser`: advertiser (publishes the receiver advertisement)
 //!
-//! # UUID 常量
+//! # UUID constants
 //!
-//! 所有 UUID 均与 CatShare 保持一致：
-//! - `SERVICE_UUID`: 广播服务 UUID，用于设备发现
-//! - `MAIN_SERVICE_UUID`: GATT 主服务 UUID
-//! - `STATUS_CHAR_UUID`: 读取 DeviceInfo 的特征
-//! - `P2P_CHAR_UUID`: 写入 P2pInfo 的特征
+//! All UUIDs match CatShare:
+//! - `SERVICE_UUID`: advertisement service UUID, used for device discovery
+//! - `MAIN_SERVICE_UUID`: GATT main service UUID
+//! - `STATUS_CHAR_UUID`: characteristic for reading DeviceInfo
+//! - `P2P_CHAR_UUID`: characteristic for writing P2pInfo
 
 pub mod advertiser;
 pub mod client;
 pub mod gatt;
 pub mod scanner;
+pub mod security;
 pub mod server;
 
 use uuid::Uuid;
 
-/// CatShare/MTA 使用 16-bit UUID: 0x3331
+/// CatShare/MTA uses 16-bit UUID: 0x3331
 ///
-/// 注意：广播发现使用自定义基底 008123456789，而不是标准蓝牙基底
+/// Note: advertisement discovery uses the custom base 008123456789, not the standard Bluetooth base
 pub const ADV_SERVICE_UUID: Uuid = Uuid::from_u128(0x00003331_0000_1000_8000_008123456789);
 
-/// Service UUID (用于扫描时匹配，使用标准蓝牙基底)
+/// Service UUID (used for matching during scanning; uses the standard Bluetooth base)
 ///
-/// 某些设备可能使用标准蓝牙基底 UUID: 00003331-0000-1000-8000-00805f9b34fb
-/// 扫描时应同时检查 ADV_SERVICE_UUID 和 SERVICE_UUID
+/// Some devices may use the standard Bluetooth base UUID: 00003331-0000-1000-8000-00805f9b34fb
+/// Scanning should check both ADV_SERVICE_UUID and SERVICE_UUID
 pub const SERVICE_UUID: Uuid = Uuid::from_u128(0x00003331_0000_1000_8000_00805f9b34fb);
 
 /// GATT Main Service UUID
 ///
 /// CatShare: `00009955-0000-1000-8000-00805f9b34fb`
-/// 用于 GATT 服务注册，包含 STATUS 和 P2P 特征
+/// Used for GATT service registration; contains the STATUS and P2P characteristics
 pub const MAIN_SERVICE_UUID: Uuid = Uuid::from_u128(0x00009955_0000_1000_8000_00805f9b34fb);
 
-/// STATUS 特征 UUID (读取 DeviceInfo)
+/// STATUS characteristic UUID (reads DeviceInfo)
 ///
 /// CatShare: `00009954-0000-1000-8000-00805f9b34fb`
 pub const STATUS_CHAR_UUID: Uuid = Uuid::from_u128(0x00009954_0000_1000_8000_00805f9b34fb);
 
-/// P2P 特征 UUID (写入 P2pInfo)
+/// P2P characteristic UUID (writes P2pInfo)
 ///
 /// CatShare: `00009953-0000-1000-8000-00805f9b34fb`
 pub const P2P_CHAR_UUID: Uuid = Uuid::from_u128(0x00009953_0000_1000_8000_00805f9b34fb);
 
-/// DeviceInfo - 与 CatShare 的 DeviceInfo 完全兼容
+/// DeviceInfo - fully compatible with CatShare's DeviceInfo
 ///
-/// CatShare Kotlin 定义:
+/// CatShare Kotlin definition:
 /// ```kotlin
 /// data class DeviceInfo(val state: Int, val key: String?, val mac: String, val catShare: Int? = null)
 /// ```
 ///
-/// # 字段
+/// # Fields
 ///
-/// - `state`: 设备状态 (通常为 0)
-/// - `key`: Base64 编码的 ECDH 公钥 (SPKI 格式)
-/// - `mac`: 设备 MAC 地址
-/// - `cat_share`: 协议版本号 (序列化为 `catShare`)
+/// - `state`: device state (usually 0)
+/// - `key`: Base64-encoded ECDH public key (SPKI format)
+/// - `mac`: device MAC address
+/// - `cat_share`: protocol version number (serialized as `catShare`)
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
@@ -77,12 +78,12 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// 创建新的 DeviceInfo
+    /// Create a new DeviceInfo
     ///
-    /// # 参数
+    /// # Arguments
     ///
-    /// - `public_key`: Base64 编码的 ECDH 公钥
-    /// - `mac`: 设备 MAC 地址
+    /// - `public_key`: Base64-encoded ECDH public key
+    /// - `mac`: device MAC address
     pub fn new(public_key: String, mac: String) -> Self {
         Self {
             state: 0,
@@ -102,54 +103,54 @@ pub use server::{GattServer, GattServerHandle, P2pReceiveEvent};
 mod tests {
     use super::*;
 
-    /// 验证 UUID 常量与 CatShare 一致
+    /// Verify that the UUID constants match CatShare
     #[test]
     fn test_uuid_constants() {
-        // 广播服务 UUID (CatShare ADV_SERVICE_UUID)
+        // Advertisement service UUID (CatShare ADV_SERVICE_UUID)
         assert_eq!(
             ADV_SERVICE_UUID.to_string(),
             "00003331-0000-1000-8000-008123456789"
         );
 
-        // 标准蓝牙基底版本的服务 UUID
+        // Service UUID with the standard Bluetooth base
         assert_eq!(
             SERVICE_UUID.to_string(),
             "00003331-0000-1000-8000-00805f9b34fb"
         );
 
-        // GATT 主服务 UUID
+        // GATT main service UUID
         assert_eq!(
             MAIN_SERVICE_UUID.to_string(),
             "00009955-0000-1000-8000-00805f9b34fb"
         );
 
-        // STATUS 特征 UUID
+        // STATUS characteristic UUID
         assert_eq!(
             STATUS_CHAR_UUID.to_string(),
             "00009954-0000-1000-8000-00805f9b34fb"
         );
 
-        // P2P 特征 UUID
+        // P2P characteristic UUID
         assert_eq!(
             P2P_CHAR_UUID.to_string(),
             "00009953-0000-1000-8000-00805f9b34fb"
         );
     }
 
-    /// 验证 DeviceInfo 序列化与 CatShare 兼容
+    /// Verify that DeviceInfo serialization is compatible with CatShare
     #[test]
     fn test_device_info_serialization() {
         let info = DeviceInfo::new("BASE64KEY".to_string(), "AA:BB:CC:DD:EE:FF".to_string());
 
         let json = serde_json::to_string(&info).unwrap();
 
-        // 验证 camelCase 命名
+        // Verify camelCase naming
         assert!(json.contains("\"state\":"));
         assert!(json.contains("\"key\":"));
         assert!(json.contains("\"mac\":"));
-        assert!(json.contains("\"catShare\":")); // 不是 cat_share
+        assert!(json.contains("\"catShare\":")); // not cat_share
 
-        // 验证值
+        // Verify values
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["state"], 0);
         assert_eq!(parsed["key"], "BASE64KEY");
@@ -157,10 +158,10 @@ mod tests {
         assert_eq!(parsed["catShare"], 1);
     }
 
-    /// 验证 DeviceInfo 反序列化与 CatShare 兼容
+    /// Verify that DeviceInfo deserialization is compatible with CatShare
     #[test]
     fn test_device_info_deserialization() {
-        // 模拟 CatShare 发送的 JSON
+        // Simulate JSON sent by CatShare
         let json = r#"{"state":0,"key":"ABC123","mac":"11:22:33:44:55:66","catShare":2}"#;
 
         let info: DeviceInfo = serde_json::from_str(json).unwrap();
@@ -171,10 +172,10 @@ mod tests {
         assert_eq!(info.cat_share, Some(2));
     }
 
-    /// 验证 DeviceInfo 可选字段处理
+    /// Verify DeviceInfo optional field handling
     #[test]
     fn test_device_info_optional_fields() {
-        // 没有 key 和 catShare
+        // No key or catShare
         let json = r#"{"state":1,"mac":"00:00:00:00:00:00"}"#;
 
         let info: DeviceInfo = serde_json::from_str(json).unwrap();
@@ -185,7 +186,7 @@ mod tests {
         assert_eq!(info.cat_share, None);
     }
 
-    /// 验证空 key 序列化时被跳过
+    /// Verify that an empty key is skipped during serialization
     #[test]
     fn test_device_info_skip_none() {
         let info = DeviceInfo {
@@ -197,7 +198,7 @@ mod tests {
 
         let json = serde_json::to_string(&info).unwrap();
 
-        // None 字段应该被跳过
+        // None fields should be skipped
         assert!(!json.contains("key"));
         assert!(!json.contains("catShare"));
     }

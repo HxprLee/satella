@@ -1,21 +1,23 @@
-//! HTTP/HTTPS 接收客户端
+//! HTTP/HTTPS receive client
 //!
-//! 与 CatShare 兼容的文件接收客户端。
+//! File receive client compatible with CatShare.
 //!
-//! # 功能
+//! # Features
 //!
-//! - 连接发送端的 HTTPS WebSocket
-//! - 协商版本和处理发送请求
-//! - 下载 ZIP 文件并解压
+//! - Connects to the sender's HTTPS WebSocket
+//! - Negotiates the version and handles send requests
+//! - Downloads the ZIP file and extracts it
 //!
-//! # 安全性
+//! # Security
 //!
-//! - 使用 HTTPS 传输（跳过证书验证，因为发送端使用自签名证书）
-//! - WebSocket 协议用于状态同步
+//! - Uses HTTPS (certificate validation is skipped because the sender uses a
+//!   self-signed certificate)
+//! - WebSocket protocol is used for status synchronization
 
 use log::{debug, error, info, warn};
 
 use crate::transfer::protocol::{SendRequest, WsMessage};
+use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::io::Read;
 use std::path::PathBuf;
@@ -23,22 +25,26 @@ use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::Message;
 
-/// 接收事件回调
+/// Receive event callback
+#[async_trait]
 pub trait ReceiverCallback: Send + Sync {
-    /// 收到发送请求，返回是否接受
-    fn on_send_request(&self, request: &SendRequest) -> bool;
+    /// Called on a send request; returns whether to accept it
+    ///
+    /// The sender waits for this answer, so an implementation may take its
+    /// time, for example by asking the user first.
+    async fn on_send_request(&self, request: &SendRequest) -> bool;
 
-    /// 进度更新
+    /// Progress update
     fn on_progress(&self, received: u64, total: u64);
 
-    /// 接收完成
+    /// Receive complete
     fn on_complete(&self, files: Vec<PathBuf>);
 
-    /// 接收失败
+    /// Receive failed
     fn on_error(&self, error: String);
 }
 
-/// 文件接收客户端
+/// File receive client
 pub struct ReceiverClient {
     host: String,
     port: u16,
@@ -54,29 +60,29 @@ impl ReceiverClient {
         }
     }
 
-    /// 开始接收
+    /// Starts receiving
     pub async fn start<C: ReceiverCallback>(&self, callback: &C) -> anyhow::Result<Vec<PathBuf>> {
-        // 创建输出目录
+        // Create the output directory
         create_dir_all(&self.output_dir).await?;
 
-        // 连接 WebSocket (不验证证书)
+        // Connect the WebSocket (without certificate validation)
         let ws_url = format!("wss://{}:{}/websocket", self.host, self.port);
         info!("Connecting to WebSocket: {}", ws_url);
 
-        // 使用不验证证书的 TLS 配置
+        // Use a TLS configuration that skips certificate validation
         let connector = native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
         let connector = tokio_native_tls::TlsConnector::from(connector);
 
-        // 建立 TCP 连接
+        // Establish the TCP connection
         let tcp_stream =
             tokio::net::TcpStream::connect(format!("{}:{}", self.host, self.port)).await?;
 
-        // TLS 握手
+        // TLS handshake
         let tls_stream = connector.connect(&self.host, tcp_stream).await?;
 
-        // WebSocket 握手
+        // WebSocket handshake
         let (ws_stream, _) = tokio_tungstenite::client_async(&ws_url, tls_stream).await?;
 
         let (mut write, mut read) = ws_stream.split();
@@ -85,7 +91,7 @@ impl ReceiverClient {
         let mut task_id: Option<String> = None;
         let mut total_size: u64 = 0;
 
-        // 消息循环
+        // Message loop
         while let Some(msg) = read.next().await {
             let msg = match msg {
                 Ok(Message::Text(text)) => text.to_string(),
@@ -112,7 +118,7 @@ impl ReceiverClient {
 
             match ws_msg.name.as_str() {
                 "versionNegotiation" => {
-                    // 版本协商
+                    // Version negotiation
                     let ack = WsMessage::ack(
                         ws_msg.id,
                         "versionNegotiation",
@@ -136,21 +142,21 @@ impl ReceiverClient {
                         };
                         total_size = request.total_size;
 
-                        // 获取任务 ID
+                        // Get the task ID
                         let req_task_id = request.get_task_id();
 
-                        // 询问用户是否接受
-                        if callback.on_send_request(&request) {
+                        // Ask the user whether to accept
+                        if callback.on_send_request(&request).await {
                             task_id = Some(req_task_id.clone());
 
-                            // 发送 ACK
+                            // Send the ACK
                             let ack = WsMessage::ack(ws_msg.id, "sendRequest", None);
                             write.send(Message::Text(ack.to_string())).await?;
 
-                            // 开始下载
+                            // Start downloading
                             break;
                         } else {
-                            // 拒绝
+                            // Refuse
                             msg_id += 1;
                             let status = WsMessage::status(msg_id, &req_task_id, 3, "user refuse");
                             write.send(Message::Text(status.to_string())).await?;
@@ -160,14 +166,14 @@ impl ReceiverClient {
                 }
 
                 _ => {
-                    // 发送 ACK
+                    // Send the ACK
                     let ack = WsMessage::ack(ws_msg.id, &ws_msg.name, None);
                     write.send(Message::Text(ack.to_string())).await?;
                 }
             }
         }
 
-        // 下载文件
+        // Download the file
         let task_id = task_id.ok_or_else(|| anyhow::anyhow!("No task ID received"))?;
         let download_url = format!(
             "https://{}:{}/download?taskId={}",
@@ -176,7 +182,7 @@ impl ReceiverClient {
 
         info!("Downloading file from: {}", download_url);
 
-        // 使用不验证证书的 HTTP 客户端
+        // Use an HTTP client that skips certificate validation
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
@@ -184,10 +190,10 @@ impl ReceiverClient {
         let response = client.get(&download_url).send().await?;
         let zip_bytes = response.bytes().await?;
 
-        // 解压 ZIP
+        // Extract the ZIP
         let files = self.extract_zip(&zip_bytes, callback, total_size).await?;
 
-        // 发送完成状态
+        // Send the completion status
         msg_id += 1;
         let status = WsMessage::status(msg_id, &task_id, 1, "ok");
         write.send(Message::Text(status.to_string())).await?;
@@ -210,7 +216,8 @@ impl ReceiverClient {
         let mut files = Vec::new();
 
         for i in 0..archive.len() {
-            // 读取并写入 (先读到内存，释放 zip 文件句柄避免跨 await)
+            // Read and write (read into memory first to release the zip file
+            // handle and avoid holding it across an await)
             let (filename, buffer, is_dir) = {
                 let mut file = archive.by_index(i)?;
                 let is_dir = file.is_dir();

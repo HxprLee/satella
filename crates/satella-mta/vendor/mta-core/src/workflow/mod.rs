@@ -1,6 +1,6 @@
-//! 工作流模块
+//! Workflow module
 //!
-//! 提供高层 API 封装完整的发送/接收流程
+//! Provides a high-level API that wraps the complete send/receive flow
 
 pub mod receiver;
 pub mod sender;

@@ -1,19 +1,19 @@
-//! BLE Client - 用于发送端连接接收端
+//! BLE Client - lets the sender connect to the receiver
 //!
-//! 提供与 CatShare GATT Server 通信的客户端实现。
+//! Provides a client implementation for communicating with the CatShare GATT Server.
 //!
-//! # 连接流程
+//! # Connection flow
 //!
-//! 1. 连接到目标设备的 GATT Server
-//! 2. 读取 CHAR_STATUS 获取 DeviceInfo (包含对方公钥)
-//! 3. 派生会话密钥 (ECDH)
-//! 4. 加密 P2pInfo 并写入 CHAR_P2P
+//! 1. Connect to the target device's GATT Server
+//! 2. Read CHAR_STATUS to get the DeviceInfo (including the peer's public key)
+//! 3. Derive the session key (ECDH)
+//! 4. Encrypt P2pInfo and write it to CHAR_P2P
 //!
-//! # 安全性
+//! # Security
 //!
-//! - 使用 ECDH P-256 密钥协商
-//! - P2pInfo 中的敏感字段 (SSID, PSK, MAC) 使用 AES-256-CTR 加密
-//! - 每次连接使用新的临时密钥对
+//! - Uses ECDH P-256 key agreement
+//! - Sensitive fields in P2pInfo (SSID, PSK, MAC) are encrypted with AES-256-CTR
+//! - Each connection uses a new ephemeral key pair
 
 use crate::ble::{DeviceInfo, MAIN_SERVICE_UUID, P2P_CHAR_UUID, STATUS_CHAR_UUID};
 use crate::crypto::{BleSecurity, BleSecurityPersistent};
@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
 
-/// BLE 客户端错误
+/// BLE client errors
 #[derive(Debug, thiserror::Error)]
 pub enum BleClientError {
     #[error("No Bluetooth adapters found")]
@@ -49,6 +49,30 @@ pub enum BleClientError {
 
     #[error("Protocol error: {0}")]
     ProtocolError(String),
+
+    /// The peer or BlueZ pushed the link into a state that requires SMP pairing. MTA does not need pairing.
+    ///
+    /// Common sources: after ATT `INSUFFICIENT_ENCRYPTION`, BlueZ raises the level to MEDIUM and retries;
+    /// or SMP gets stuck during the connection, so BlueZ never sees `ServicesResolved` and
+    /// bluez-async reports `Service discovery timed out` after its hard-coded 5 seconds.
+    ///
+    /// Note the wording: a timeout alone **cannot** prove the peer wants encryption. The MTA
+    /// characteristics on the phone side measured only `read`/`write` flags and MTU 517, and
+    /// never required encryption.
+    /// The usual real cause of the timeout is that the adapter was made unpairable, so the
+    /// kernel rejected the phone's SMP outright and pairing can never complete.
+    #[error(
+        "the peer started a pairing handshake that never completed, which MTA does not need: {0}"
+    )]
+    PairingRequired(String),
+
+    /// The ATT MTU is too small, so the P2P write uses long-write, which in turn triggers a pairing upgrade.
+    #[error("ATT MTU {mtu} is too small for a {payload_len}-byte P2P write (need {needed})")]
+    AttMtuTooSmall {
+        mtu: u16,
+        payload_len: usize,
+        needed: u16,
+    },
 }
 
 pub struct BleClient {
@@ -65,21 +89,26 @@ impl BleClient {
             .next()
             .ok_or(BleClientError::NoAdapter)?;
 
+        // The sender does not register an agent that rejects pairing: once SMP is triggered,
+        // rejecting it only makes ServicesResolved never arrive, which shows up as Service
+        // discovery timed out. The right fix is a single-packet MTU write that avoids
+        // triggering SMP (see connect_and_handshake).
+
         Ok(Self {
             adapter,
             security: None,
         })
     }
 
-    /// 设置持久化安全上下文，使发送端身份保持稳定
+    /// Set a persistent security context so the sender identity stays stable
     pub fn with_security(mut self, security: Arc<BleSecurityPersistent>) -> Self {
         self.security = Some(security);
         self
     }
 
-    /// 连接到设备并执行 P2P 握手
+    /// Connect to a device and perform the P2P handshake
     ///
-    /// 返回接收端的 DeviceInfo
+    /// Returns the receiver's DeviceInfo
     pub async fn connect_and_handshake(
         &self,
         device_address: &str,
@@ -90,10 +119,12 @@ impl BleClient {
             .await
     }
 
-    /// 和 `connect_and_handshake` 一样，但允许在随机地址失效时按设备名找。
+    /// Same as `connect_and_handshake`, but allows falling back to the device name when
+    /// the random address is stale.
     ///
-    /// Android 的 BLE 地址是会轮换的随机地址。扫描器看到的地址到真正连接
-    /// 时可能已经变了；只按地址找会报 `Device not found`。
+    /// Android BLE addresses are random addresses that rotate. The address the scanner saw
+    /// may already have changed by the time the real connection happens; looking it up by
+    /// address alone reports `Device not found`.
     pub async fn connect_and_handshake_named(
         &self,
         device_address: &str,
@@ -101,33 +132,41 @@ impl BleClient {
         p2p_info: &P2pInfo,
         sender_id: &str,
     ) -> Result<DeviceInfo, BleClientError> {
-        // 查找目标设备
+        // Find the target device
         let peripheral = self.find_device(device_address, device_name).await?;
 
-        // 连接。Android 刚被扫描到时偶尔还会拒绝一次连接，给几次机会。
+        // Connect. An Android device that was just discovered sometimes rejects a connection
+        // once, so give it a few chances. bluez-async's connect() waits for ServicesResolved;
+        // if the peer is pushing SMP, this fails with Service discovery timed out — treat
+        // that as PairingRequired.
         info!("Connecting to BLE device: {}", device_address);
         for attempt in 1..=3 {
             match peripheral.connect().await {
                 Ok(()) => break,
-                Err(err) if attempt < 3 => {
-                    debug!("BLE connect failed (attempt {attempt}/3): {err}");
-                    time::sleep(Duration::from_millis(500)).await;
+                Err(err) => {
+                    let mapped = map_connect_error(err);
+                    if attempt < 3 && !matches!(mapped, BleClientError::PairingRequired(_)) {
+                        debug!("BLE connect failed (attempt {attempt}/3): {mapped}");
+                        time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    return Err(mapped);
                 }
-                Err(err) => return Err(err.into()),
             }
         }
 
-        // 等待连接稳定。刚连上时 BlueZ 可能还没把属性读完。
+        // Wait for the connection to settle. Right after connecting, BlueZ may not have
+        // finished reading properties / negotiating the MTU.
         time::sleep(Duration::from_millis(800)).await;
 
-        // 请求更大的 MTU
-        // Note: btleplug 不直接支持 MTU 请求，跳过
-
-        // 发现服务
+        // Discover services
         debug!("Discovering GATT services...");
-        peripheral.discover_services().await?;
+        peripheral
+            .discover_services()
+            .await
+            .map_err(map_connect_error)?;
 
-        // 查找并读取 STATUS 特征
+        // Find and read the STATUS characteristic
         let status_char = self.find_characteristic(&peripheral, STATUS_CHAR_UUID)?;
         let status_data = read_with_retry(&peripheral, &status_char).await?;
         let device_info: DeviceInfo = serde_json::from_slice(&status_data)
@@ -139,17 +178,17 @@ impl BleClient {
         );
         trace!("Full DeviceInfo: {:?}", device_info);
 
-        // 如果对方提供了公钥，派生会话密钥并加密 P2P 信息
+        // If the peer provided a public key, derive the session key and encrypt the P2P info
         let p2p_data = if let Some(peer_key) = &device_info.key {
             let (sender_public_key, cipher) = if let Some(sec) = &self.security {
-                // 使用持久化上下文
+                // Use the persistent context
                 let pub_key = sec.get_public_key().to_string();
                 let cip = sec.derive_session_key(peer_key).map_err(|e| {
                     BleClientError::ProtocolError(format!("Key exchange failed: {}", e))
                 })?;
                 (pub_key, cip)
             } else {
-                // 回退到临时上下文
+                // Fall back to an ephemeral context
                 let security = BleSecurity::new().map_err(|e| {
                     BleClientError::ProtocolError(format!("Failed to init security: {}", e))
                 })?;
@@ -160,7 +199,7 @@ impl BleClient {
                 (pub_key, cip)
             };
 
-            // 加密 P2P 信息
+            // Encrypt the P2P info
             let encrypted_p2p = P2pInfo::with_encryption(
                 sender_id.to_string(),
                 cipher
@@ -178,20 +217,63 @@ impl BleClient {
             serde_json::to_vec(&encrypted_p2p)
                 .map_err(|e| BleClientError::ProtocolError(e.to_string()))?
         } else {
-            // 不加密
+            // No encryption
             serde_json::to_vec(p2p_info)
                 .map_err(|e| BleClientError::ProtocolError(e.to_string()))?
         };
 
-        // 写入 P2P 特征
+        // Write the P2P characteristic
         let p2p_char = self.find_characteristic(&peripheral, P2P_CHAR_UUID)?;
         info!(
             "Writing encrypted P2P info ({} bytes) to receiver",
             p2p_data.len()
         );
+
+        // The payload must fit in a single ATT packet, otherwise BlueZ uses long-write
+        // (prepare-write/execute-write). That is exactly where the phone most often replies
+        // `INSUFFICIENT_ENCRYPTION`, and it is also where the pairing dialog comes from.
+        //
+        // On the phone side the ATT MTU measures 517 and the encrypted P2P JSON is about
+        // 266 bytes, so it fits in one packet. Reading the MTU is only to fail early if it
+        // really does not fit, instead of discovering that at long-write time. And do not
+        // force the write when it does not fit — that is precisely what triggers pairing.
+        //
+        // Failing to read the MTU (`None`) is not a failure: it only means we cannot tell,
+        // so take BlueZ's normal write path and let it negotiate the MTU itself.
+        let needed_mtu = crate::ble::security::mtu_for_payload(p2p_data.len());
+        let actual_address = peripheral
+            .properties()
+            .await
+            .ok()
+            .flatten()
+            .map(|props| props.address.to_string())
+            .unwrap_or_else(|| device_address.to_owned());
+        match crate::ble::security::wait_for_single_packet_mtu(&actual_address, p2p_data.len())
+            .await
+        {
+            Ok(Some(gatt_mtu)) => {
+                debug!(
+                    "The P2P payload needs an ATT MTU of {needed_mtu}; BlueZ reports {gatt_mtu}"
+                );
+                if !crate::ble::security::fits_in_single_packet(p2p_data.len(), gatt_mtu) {
+                    return Err(BleClientError::AttMtuTooSmall {
+                        mtu: gatt_mtu,
+                        payload_len: p2p_data.len(),
+                        needed: needed_mtu,
+                    });
+                }
+            }
+            Ok(None) => {
+                debug!("Could not read the ATT MTU; leaving the write to BlueZ's own negotiation");
+            }
+            Err(err) => {
+                debug!("The ATT MTU probe failed: {err}");
+            }
+        }
+
         write_with_retry(&peripheral, &p2p_char, &p2p_data).await?;
 
-        // 断开连接
+        // Disconnect
         peripheral.disconnect().await?;
 
         Ok(device_info)
@@ -206,8 +288,8 @@ impl BleClient {
             return Ok(peripheral);
         }
 
-        // 适配器自己的缓存里没有目标：先扫一轮。扫描器用的是另一个
-        // BlueZ 会话，它看到的设备不一定在这个 `Adapter` 的列表里。
+        // The target is not in the adapter's own cache: scan first. The scanner uses another
+        // BlueZ session, so devices it sees are not necessarily in this `Adapter`'s list.
         debug!("{address} is not in the adapter cache, scanning for it");
         if let Err(err) = self.adapter.start_scan(ScanFilter::default()).await {
             debug!("could not start a BLE scan: {err}");
@@ -235,8 +317,8 @@ impl BleClient {
             return Ok(peripheral);
         }
 
-        // 随机地址可能已经轮换。设备名是稳定的，但只在唯一匹配时采用，
-        // 免得把文件发给同名的另一台设备。
+        // The random address may have rotated. The device name is stable, but only adopt it
+        // on a unique match, so files are not sent to another device with the same name.
         if let Some(name) = name.filter(|name| !name.is_empty())
             && let Some(peripheral) = self.device_by_name(name).await?
         {
@@ -308,7 +390,13 @@ impl BleClient {
     }
 }
 
-/// 读一个特征；ATT 请求偶尔会超时，给三次机会。
+/// Read a characteristic; ATT requests occasionally time out, so allow three attempts.
+///
+/// But **security errors are not retried**: after `INSUFFICIENT_ENCRYPTION`, BlueZ
+/// automatically raises the channel security level to MEDIUM and retries, and a
+/// MEDIUM-level link can only be obtained through pairing. So every retry drives the
+/// pairing request again, and a pairing-code dialog may pop up on the desktop. Such
+/// errors should fail immediately so the caller sees the real cause.
 async fn read_with_retry(
     peripheral: &PlatformPeripheral,
     characteristic: &Characteristic,
@@ -319,6 +407,10 @@ async fn read_with_retry(
         match peripheral.read(characteristic).await {
             Ok(data) => return Ok(data),
             Err(err) => {
+                if is_security_error(&err) {
+                    return Err(BleClientError::PairingRequired(err.to_string()));
+                }
+
                 debug!("BLE read failed (attempt {attempt}/3): {err}");
                 last_error = Some(err);
 
@@ -332,7 +424,10 @@ async fn read_with_retry(
     Err(last_error.expect("the loop runs at least once").into())
 }
 
-/// 写一个特征；同样的重试逻辑。写入的是同一个值，重试是幂等的。
+/// Write a characteristic; same retry logic. It writes the same value, so retries are
+/// idempotent.
+///
+/// Security errors are likewise not retried; see [`read_with_retry`] for the reason.
 async fn write_with_retry(
     peripheral: &PlatformPeripheral,
     characteristic: &Characteristic,
@@ -347,6 +442,10 @@ async fn write_with_retry(
         {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if is_security_error(&err) {
+                    return Err(BleClientError::PairingRequired(err.to_string()));
+                }
+
                 debug!("BLE write failed (attempt {attempt}/3): {err}");
                 last_error = Some(err);
 
@@ -358,4 +457,109 @@ async fn write_with_retry(
     }
 
     Err(last_error.expect("the loop runs at least once").into())
+}
+
+/// Is a connection / service discovery failure actually stuck pairing?
+///
+/// Note: a service discovery timeout does **not** mean "the peer wants encryption".
+/// bluez-async only allows 5 seconds for `ServicesResolved`; an unpairable adapter or
+/// incomplete peer SMP both cause a timeout.
+fn map_connect_error(err: btleplug::Error) -> BleClientError {
+    if is_security_error(&err) || is_service_discovery_timeout(&err) {
+        BleClientError::PairingRequired(err.to_string())
+    } else {
+        BleClientError::IoError(err)
+    }
+}
+
+fn is_service_discovery_timeout(err: &btleplug::Error) -> bool {
+    let haystack = format!("{} {:?}", err, err).to_lowercase();
+    let normalized: String = haystack.chars().filter(|c| c.is_alphanumeric()).collect();
+    normalized.contains("servicediscoverytimedout")
+}
+
+/// Is this error a signal that "the peer requires encryption"?
+///
+/// BlueZ translates ATT's `INSUFFICIENT_ENCRYPTION`, `AUTHENTICATION` and
+/// `INSUFFICIENT_ENCRYPTION_KEY_SIZE` into the D-Bus errors
+/// `org.bluez.Error.NotPermitted` / `org.bluez.Error.AuthenticationFailed`, with the
+/// message "Not paired". btleplug passes D-Bus errors through unchanged.
+///
+/// They are recognised so that such errors are **not retried**: a retry only triggers
+/// pairing again.
+///
+/// The catch is that `dbus::Error`'s `Display` prints only the message and **not** the
+/// D-Bus error name (see the `dbus` crate's `impl Display for Error`), so both spellings
+/// must be guarded: "Not permitted" (message) and "NotPermitted" (error name, only in
+/// `Debug`). After normalization, both are matched in space-free form.
+fn is_security_error(err: &btleplug::Error) -> bool {
+    // `Display` gives the message, `Debug` gives the D-Bus error name; check both.
+    let haystack = format!("{} {:?}", err, err).to_lowercase();
+
+    let normalized: String = haystack.chars().filter(|c| c.is_alphanumeric()).collect();
+
+    [
+        "notpaired",
+        "notpermitted",
+        "insufficientencryption",
+        "authenticationfailed",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BlueZ translates "the peer requires encryption" into "Not paired" / "Not permitted".
+    /// Such errors must not be retried: a retry only drives pairing once more.
+    #[test]
+    fn security_errors_are_recognised() {
+        for msg in [
+            "Not paired",
+            "not permitted",
+            "Insufficient encryption",
+            "Authentication failed",
+            // D-Bus error names only appear in Debug
+            "org.bluez.Error.NotPermitted",
+            "org.bluez.Error.AuthenticationFailed",
+            "org.bluez.Error.InsufficientEncryption",
+        ] {
+            let err = btleplug::Error::Other(msg.into());
+            assert!(
+                is_security_error(&err),
+                "should have been recognised as a security error: {msg}"
+            );
+        }
+    }
+
+    /// Ordinary errors such as timeouts are retried as usual.
+    #[test]
+    fn ordinary_errors_are_not_security_errors() {
+        for msg in [
+            "Timeout",
+            "Device not found",
+            "Connection refused",
+            "Not connected",
+            "Timed out after 5s",
+        ] {
+            let err = btleplug::Error::Other(msg.into());
+            assert!(
+                !is_security_error(&err),
+                "should not have been recognised as a security error: {msg}"
+            );
+        }
+    }
+
+    /// bluez-async reports Service discovery timed out when SMP gets stuck.
+    #[test]
+    fn service_discovery_timeout_maps_to_pairing_required() {
+        let err = btleplug::Error::Other("Service discovery timed out".into());
+        assert!(is_service_discovery_timeout(&err));
+        assert!(matches!(
+            map_connect_error(err),
+            BleClientError::PairingRequired(_)
+        ));
+    }
 }

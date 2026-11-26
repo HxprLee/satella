@@ -179,6 +179,24 @@ impl ProtocolAdapter for QuickShareAdapter {
                         }
                     }
 
+                    // A transfer that was waiting for the consent and then
+                    // ended on its own is gone, so the decision that was asked
+                    // for can be withdrawn.
+                    if message.rtype == Some(TransferType::Inbound)
+                        && matches!(
+                            state,
+                            satella_quickshare_vendor::State::Cancelled
+                                | satella_quickshare_vendor::State::Disconnected
+                        )
+                    {
+                        let _ = events
+                            .send(AdapterEvent::ReceiveExpired {
+                                protocol: Protocol::QuickShare,
+                                transfer_id: message.id.clone(),
+                            })
+                            .await;
+                    }
+
                     if message.rtype == Some(TransferType::Inbound) {
                         let total = message
                             .meta

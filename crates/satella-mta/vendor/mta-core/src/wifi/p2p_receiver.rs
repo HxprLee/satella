@@ -1,16 +1,16 @@
-//! WiFi P2P 接收端 (Client)
+//! WiFi P2P receiver (client)
 //!
-//! 连接到发送端创建的 P2P 热点。
+//! Connects to the P2P hotspot created by the sender.
 //!
-//! # 连接策略（优先级从高到低）
+//! # Connection strategy (highest priority first)
 //!
-//! 1. **NmClient D-Bus**: 使用 NetworkManager 原生 D-Bus 接口
-//! 2. **普通 WiFi 连接**: 退回到简单命令行（仅作为备用）
+//! 1. **NmClient D-Bus**: use NetworkManager's native D-Bus interface
+//! 2. **Plain WiFi connection**: fall back to a simple command line (backup only)
 //!
-//! # 注意事项
+//! # Notes
 //!
-//! - 连接后自动获取 DHCP 分配的 IP 地址
-//! - 断开时会清理相关网络配置
+//! - The DHCP-assigned IP address is obtained automatically after connecting
+//! - Disconnecting cleans up the related network configuration
 
 use std::process::Command;
 use std::sync::Arc;
@@ -22,14 +22,14 @@ use tokio::sync::Mutex;
 use crate::wifi::P2pInfo;
 use crate::wifi::nm_dbus::NmClient;
 
-/// WiFi P2P 接收端配置
+/// WiFi P2P receiver configuration
 #[derive(Debug, Clone)]
 pub struct P2pReceiverConfig {
-    /// 主 WiFi 接口名（如 wlan0）
+    /// Main WiFi interface name (for example, wlan0)
     pub main_interface: String,
-    /// P2P 设备接口名（如 p2p-dev-wlan0）
+    /// P2P device interface name (for example, p2p-dev-wlan0)
     pub p2p_device: Option<String>,
-    /// 是否优先保持原有 WiFi 连接
+    /// Whether to prefer keeping the existing WiFi connection
     pub preserve_wifi: bool,
 }
 
@@ -43,14 +43,14 @@ impl Default for P2pReceiverConfig {
     }
 }
 
-/// 活动连接状态
+/// Active connection state
 struct ActiveConnection {
     connection_name: String,
     _connection_path: Option<String>,
     used_p2p_mode: bool,
 }
 
-/// WiFi P2P 接收端
+/// WiFi P2P receiver
 pub struct WiFiP2pReceiver {
     config: P2pReceiverConfig,
     nm_client: Arc<Mutex<Option<NmClient>>>,
@@ -77,7 +77,7 @@ impl WiFiP2pReceiver {
         }
     }
 
-    /// 初始化 NM 客户端
+    /// Initialize the NetworkManager client
     async fn ensure_nm_client(&self) -> anyhow::Result<()> {
         let mut client = self.nm_client.lock().await;
         if client.is_none() {
@@ -95,16 +95,16 @@ impl WiFiP2pReceiver {
         Ok(())
     }
 
-    /// 连接到 P2P 热点
+    /// Connect to the P2P hotspot
     ///
-    /// 返回分配的 IP 地址
+    /// Returns the assigned IP address
     pub async fn connect(&mut self, info: &P2pInfo) -> anyhow::Result<String> {
         info!(
             "Connecting to WiFi Direct: ssid='{}', preserve_wifi={}",
             info.ssid, self.config.preserve_wifi
         );
 
-        // 尝试使用 NmClient D-Bus
+        // Try the NmClient D-Bus path
         match self.connect_nm_dbus(info).await {
             Ok(ip) => {
                 info!("Connected via NetworkManager D-Bus, IP: {}", ip);
@@ -115,11 +115,11 @@ impl WiFiP2pReceiver {
             }
         }
 
-        // 退回到简单的 nmcli 命令
+        // Fall back to the simple nmcli command
         self.connect_nmcli_fallback(info).await
     }
 
-    /// 使用 NmClient D-Bus 连接
+    /// Connect through the NmClient D-Bus interface
     async fn connect_nm_dbus(&self, info: &P2pInfo) -> anyhow::Result<String> {
         self.ensure_nm_client().await?;
 
@@ -133,10 +133,10 @@ impl WiFiP2pReceiver {
             &info.ssid[..std::cmp::min(8, info.ssid.len())]
         );
 
-        // 删除可能存在的旧连接
+        // Delete any leftover connection with the same name
         let _ = client.delete_connection_by_name(&conn_name).await;
 
-        // 触发 WiFi 扫描
+        // Trigger a WiFi scan
         if let Some(device) = client
             .find_wifi_device(Some(&self.config.main_interface))
             .await?
@@ -145,12 +145,12 @@ impl WiFiP2pReceiver {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
-        // 创建连接
+        // Create the connection
         let conn_path = client
             .create_wifi_connection(&info.ssid, &info.psk, Some(&self.config.main_interface))
             .await?;
 
-        // 查找设备
+        // Find the device
         let device = client
             .find_wifi_device(Some(&self.config.main_interface))
             .await?
@@ -162,12 +162,12 @@ impl WiFiP2pReceiver {
             .activate_connection(&conn_path.as_ref(), &device)
             .await?;
 
-        // 等待 IP 分配
+        // Wait for the IP address assignment
         let ip = client
             .wait_for_ip(&active_conn.as_ref(), Duration::from_secs(20))
             .await?;
 
-        // 记录活动连接
+        // Record the active connection
         let mut active = self.active_connection.lock().await;
         *active = Some(ActiveConnection {
             connection_name: conn_name,
@@ -178,11 +178,11 @@ impl WiFiP2pReceiver {
         Ok(ip)
     }
 
-    /// 使用 nmcli 命令行连接（备用）
+    /// Connect through the nmcli command line (fallback)
     async fn connect_nmcli_fallback(&self, info: &P2pInfo) -> anyhow::Result<String> {
         debug!("Connecting via nmcli fallback");
 
-        // 触发扫描
+        // Trigger a scan
         let _ = Command::new("nmcli")
             .args([
                 "device",
@@ -195,7 +195,7 @@ impl WiFiP2pReceiver {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // 尝试连接
+        // Try to connect
         let output = Command::new("nmcli")
             .args([
                 "device",
@@ -214,7 +214,7 @@ impl WiFiP2pReceiver {
             return Err(anyhow::anyhow!("nmcli connection failed: {}", err));
         }
 
-        // 记录活动连接
+        // Record the active connection
         let mut active = self.active_connection.lock().await;
         *active = Some(ActiveConnection {
             connection_name: info.ssid.clone(),
@@ -222,19 +222,19 @@ impl WiFiP2pReceiver {
             used_p2p_mode: false,
         });
 
-        // 等待并获取 IP
+        // Wait for and read the IP address
         tokio::time::sleep(Duration::from_secs(2)).await;
         self.get_interface_ip(&self.config.main_interface)
     }
 
-    /// 断开连接并清理
+    /// Disconnect and clean up
     pub async fn disconnect(&mut self) -> anyhow::Result<()> {
         info!("Disconnecting WiFi P2P connection");
 
         let active = self.active_connection.lock().await.take();
 
         if let Some(conn) = active {
-            // 尝试使用 NM D-Bus 删除
+            // Try to delete through NetworkManager D-Bus
             if let Ok(()) = self.ensure_nm_client().await {
                 let client_guard = self.nm_client.lock().await;
                 if let Some(client) = client_guard.as_ref() {
@@ -244,7 +244,7 @@ impl WiFiP2pReceiver {
                 }
             }
 
-            // 也尝试 nmcli 删除（备用）
+            // Also try deleting through nmcli (fallback)
             let _ = Command::new("nmcli")
                 .args(["connection", "delete", &conn.connection_name])
                 .output();
@@ -253,7 +253,7 @@ impl WiFiP2pReceiver {
         Ok(())
     }
 
-    /// 获取接口 IP 地址
+    /// Get the interface's IP address
     fn get_interface_ip(&self, interface: &str) -> anyhow::Result<String> {
         let output = Command::new("ip")
             .args(["-o", "addr", "show", interface])
@@ -278,18 +278,18 @@ impl WiFiP2pReceiver {
         ))
     }
 
-    /// 检查是否已连接
+    /// Check whether a connection is active
     pub async fn is_connected(&self) -> bool {
         let active = self.active_connection.lock().await;
         active.is_some()
     }
 
-    /// 获取当前使用的接口名
+    /// Get the name of the interface currently in use
     pub fn active_interface(&self) -> &str {
         &self.config.main_interface
     }
 
-    /// 原有 WiFi 是否保持连接
+    /// Whether the original WiFi connection is still active
     pub async fn is_dual_connected(&self) -> bool {
         let active = self.active_connection.lock().await;
         active.as_ref().map(|a| a.used_p2p_mode).unwrap_or(false)
@@ -298,7 +298,7 @@ impl WiFiP2pReceiver {
 
 impl Drop for WiFiP2pReceiver {
     fn drop(&mut self) {
-        // 由于 Drop 是同步的，我们只能尝试使用 nmcli 清理
+        // Drop is synchronous, so the only cleanup available here is nmcli
         if let Ok(active) = self.active_connection.try_lock()
             && let Some(conn) = active.as_ref()
         {

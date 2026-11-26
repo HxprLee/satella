@@ -1,25 +1,29 @@
-//! WiFi P2P 组所有者 (Group Owner)
+//! WiFi P2P group owner
 //!
-//! 互传联盟的发送端必须是一个真正的 WiFi P2P 组所有者：对端不会连普通的
-//! 接入点，它只做 `p2p_connect`，加入名为 `DIRECT-xx` 的 P2P 组。
+//! An MTA sender must be a real WiFi P2P group owner: the peer does not join
+//! an ordinary access point, it only runs `p2p_connect` to join a P2P group
+//! named `DIRECT-xx`.
 //!
-//! # 为什么不用 NetworkManager
+//! # Why not NetworkManager
 //!
-//! NetworkManager 只能创建普通的接入点（AP），没有创建 P2P 组所有者的
-//! 接口。所以这里直接和 `wpa_supplicant` 说话。
+//! NetworkManager can only create ordinary access points (APs); it has no
+//! interface for creating a P2P group owner. This module therefore talks to
+//! `wpa_supplicant` directly.
 //!
-//! # 为什么用 D-Bus 而不是 wpa_cli
+//! # Why D-Bus instead of wpa_cli
 //!
-//! `wpa_supplicant` 的控制套接字 `/run/wpa_supplicant` 只有 root 能访问，
-//! 而它的 D-Bus 接口 `fi.w1.wpa_supplicant1` 有同样的限制。所以两条路都
-//! 需要提权；D-Bus 的好处是能直接拿到组的信息（SSID、密码），不用去猜。
+//! Only root can access `wpa_supplicant`'s control socket `/run/wpa_supplicant`,
+//! and its D-Bus interface `fi.w1.wpa_supplicant1` has the same restriction.
+//! Both paths therefore need privilege; D-Bus is better because it returns the
+//! group information (SSID and passphrase) directly instead of making us guess.
 //!
 //! # NoGroupIface
 //!
-//! 默认情况下 `wpa_supplicant` 会为 P2P 组单独建一个网络接口。很多驱动
-//! （比如 iwlwifi）不支持在那个接口上切到 P2P 模式，会报
-//! `Failed to set P2P Mode: ret=-95`。把 `NoGroupIface` 设成 true，组就
-//! 直接跑在主接口上，这样能避开驱动的这个限制。
+//! By default `wpa_supplicant` creates a separate network interface for the P2P
+//! group. Many drivers (iwlwifi, for example) cannot switch that interface to
+//! P2P mode and report `Failed to set P2P Mode: ret=-95`. Setting
+//! `NoGroupIface` to true makes the group run on the main interface instead,
+//! which avoids this driver limitation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,43 +37,46 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use zbus::zvariant::{OwnedValue, Value};
 
-/// wpa_supplicant 的 D-Bus 服务名。
+/// The D-Bus service name of `wpa_supplicant`.
 const WPA_SERVICE: &str = "fi.w1.wpa_supplicant1";
 
-/// P2P 组所有者的 IP：互传联盟固定用 192.168.49.0/24，网关是 `.1`。
+/// IP address of the P2P group owner: MTA always uses 192.168.49.0/24, with
+/// `.1` as the gateway.
 pub const GO_ADDRESS: &str = "192.168.49.1";
 
-/// P2P 组的网段长度。
+/// Prefix length of the P2P group subnet.
 pub const GO_PREFIX_LENGTH: u8 = 24;
 
-/// 需要提权的命令最多等这么久（`pkexec` 可能弹认证框）。
+/// Maximum time to wait for a privileged command (`pkexec` may show an
+/// authentication dialog).
 const PRIVILEGED_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// `fi.w1.wpa_supplicant1.Interface.P2PDevice` 接口。
+/// The `fi.w1.wpa_supplicant1.Interface.P2PDevice` interface.
 const P2P_DEVICE_INTERFACE: &str = "fi.w1.wpa_supplicant1.Interface.P2PDevice";
 
-/// `fi.w1.wpa_supplicant1.Group` 接口。
+/// The `fi.w1.wpa_supplicant1.Group` interface.
 const GROUP_INTERFACE: &str = "fi.w1.wpa_supplicant1.Group";
 
-/// `fi.w1.wpa_supplicant1.Interface` 接口。
+/// The `fi.w1.wpa_supplicant1.Interface` interface.
 const INTERFACE_INTERFACE: &str = "fi.w1.wpa_supplicant1.Interface";
 
-/// 一个 P2P 组的信息。
+/// Information about a P2P group.
 #[derive(Debug, Clone)]
 pub struct P2pGroup {
-    /// 组名，格式是 `DIRECT-xx`。
+    /// Group name, in the form `DIRECT-xx`.
     pub ssid: String,
-    /// 组密码。
+    /// Group passphrase.
     pub psk: String,
-    /// 组所有者接口的名字。
+    /// Name of the group owner interface.
     pub interface: String,
-    /// 组的频率（MHz）。
+    /// Group frequency in MHz.
     pub frequency: u32,
 }
 
-/// `satella-mta-helper create` 的 JSON 输出。
+/// JSON output of `satella-mta-helper create`.
 ///
-/// 父进程和 helper 共用这个定义，避免两边字段名漂移。
+/// The parent process and the helper share this definition so their field
+/// names cannot drift apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelperGroupInfo {
     pub ssid: String,
@@ -79,18 +86,18 @@ pub struct HelperGroupInfo {
     pub dhcp_pid: u32,
 }
 
-/// 用 `wpa_supplicant` 的 D-Bus 接口创建一个 P2P 组。
+/// Creates a P2P group through `wpa_supplicant`'s D-Bus interface.
 pub struct WpaP2pGroupOwner {
     connection: zbus::Connection,
     interface_path: String,
 }
 
 impl WpaP2pGroupOwner {
-    /// 连接到 `wpa_supplicant` 并找到主接口。
+    /// Connect to `wpa_supplicant` and find the main interface.
     pub async fn new(interface: &str) -> anyhow::Result<Self> {
         let connection = zbus::Connection::system().await?;
 
-        // 主接口（wlan0）的路径。
+        // Path of the main interface (wlan0).
         let proxy = zbus::Proxy::new(
             &connection,
             WPA_SERVICE,
@@ -114,13 +121,15 @@ impl WpaP2pGroupOwner {
         Ok(owner)
     }
 
-    /// 让 P2P 组直接跑在主接口上。
+    /// Make the P2P group run directly on the main interface.
     ///
-    /// 单独的组接口在很多驱动上切不到 P2P 模式（`ret=-95`）。
+    /// A separate group interface cannot switch to P2P mode on many drivers
+    /// (`ret=-95`).
     async fn set_no_group_iface(&self) -> anyhow::Result<()> {
         let proxy = self.p2p_proxy().await?;
 
-        // 写属性时只提交要改的键，wpa_supplicant 会保留其余配置。
+        // Only submit the key being changed; wpa_supplicant keeps the rest of
+        // the configuration.
         let config: HashMap<String, Value<'static>> =
             HashMap::from([("NoGroupIface".to_owned(), Value::Bool(true))]);
 
@@ -153,7 +162,7 @@ impl WpaP2pGroupOwner {
         .await?)
     }
 
-    /// 创建一个 P2P 组，等待它真的建立起来。
+    /// Create a P2P group and wait until it is actually established.
     pub async fn create_group(
         &self,
         frequency: u32,
@@ -161,11 +170,11 @@ impl WpaP2pGroupOwner {
     ) -> anyhow::Result<P2pGroup> {
         let proxy = self.p2p_proxy().await?;
 
-        // 之前的组可能还在，先拆掉。
+        // A previous group may still exist; tear it down first.
         let _ = proxy.call_method("Disconnect", &()).await;
 
-        // D-Bus 的 `GroupAdd` 把 frequency 定义成有符号 32 位整数，
-        // 这与 `Frequency` 属性的 `q` 不同。
+        // D-Bus `GroupAdd` defines frequency as a signed 32-bit integer,
+        // unlike the `q` used by the `Frequency` property.
         let frequency = i32::try_from(frequency)
             .map_err(|_| anyhow::anyhow!("frequency {frequency} does not fit in an i32"))?;
         let args: HashMap<String, Value<'static>> =
@@ -186,7 +195,7 @@ impl WpaP2pGroupOwner {
         Ok(group)
     }
 
-    /// 等组建立起来，然后读出它的 SSID 和密码。
+    /// Wait for the group to be established, then read its SSID and passphrase.
     async fn wait_for_group(&self, timeout: Duration) -> anyhow::Result<P2pGroup> {
         let deadline = Instant::now() + timeout;
 
@@ -205,7 +214,7 @@ impl WpaP2pGroupOwner {
         }
     }
 
-    /// 读当前这个组的信息。
+    /// Read the information of the current group.
     async fn current_group(&self) -> anyhow::Result<Option<P2pGroup>> {
         let proxy = self.p2p_proxy().await?;
 
@@ -222,7 +231,7 @@ impl WpaP2pGroupOwner {
             return Ok(None);
         }
 
-        // 组对象在 `fi.w1.wpa_supplicant1` 上。
+        // The group object lives under `fi.w1.wpa_supplicant1`.
         let group_proxy = zbus::Proxy::new(
             &self.connection,
             WPA_SERVICE,
@@ -250,7 +259,7 @@ impl WpaP2pGroupOwner {
         }))
     }
 
-    /// 拆掉这个组。
+    /// Tear down this group.
     pub async fn remove_group(&self) -> anyhow::Result<()> {
         let proxy = self.p2p_proxy().await?;
         if let Err(err) = proxy.call_method("Disconnect", &()).await {
@@ -260,22 +269,25 @@ impl WpaP2pGroupOwner {
     }
 }
 
-/// 创建/销毁 P2P 组所需要的那一小部分特权操作。
+/// The small set of privileged operations needed to create and destroy a P2P
+/// group.
 ///
-/// Linux 上有两个实现：已经以 root 运行时直接在进程内和 `wpa_supplicant`
-/// 说话（[`InProcessGroupOwner`]）；普通用户运行时调用一次性的
-/// [`HelperGroupOwner`]。将来的 Windows/macOS 后端只要实现这个 trait，
-/// 发送流程就不用跟着改。
+/// Linux has two implementations: when already running as root, talk to
+/// `wpa_supplicant` in-process ([`InProcessGroupOwner`]); when running as an
+/// ordinary user, call the one-shot [`HelperGroupOwner`]. A future
+/// Windows/macOS backend only needs to implement this trait, and the send
+/// workflow does not have to change.
 #[async_trait]
 pub trait GroupOwnerBackend: Send + Sync {
-    /// 在指定频率上创建组，并配好地址和 DHCP。
+    /// Create a group on the given frequency, configure its address, and start
+    /// DHCP.
     async fn create_group(&self, frequency: u32) -> anyhow::Result<P2pGroup>;
 
-    /// 拆掉组、停掉 DHCP，并去掉地址。
+    /// Tear down the group, stop DHCP, and remove the address.
     async fn destroy_group(&self) -> anyhow::Result<()>;
 }
 
-/// 已经以 root 运行时使用的后端。
+/// Backend used when already running as root.
 pub struct InProcessGroupOwner {
     owner: WpaP2pGroupOwner,
     state: Mutex<Option<InProcessGroupState>>,
@@ -287,7 +299,7 @@ struct InProcessGroupState {
 }
 
 impl InProcessGroupOwner {
-    /// 连接到 `wpa_supplicant`，准备在 `interface` 上建组。
+    /// Connect to `wpa_supplicant`, ready to create a group on `interface`.
     pub async fn new(interface: &str) -> anyhow::Result<Self> {
         Ok(Self {
             owner: WpaP2pGroupOwner::new(interface).await?,
@@ -365,10 +377,12 @@ impl GroupOwnerBackend for InProcessGroupOwner {
     }
 }
 
-/// 普通用户运行时使用的后端：每次操作调用一次 `satella-mta-helper`。
+/// Backend used when running as an ordinary user: calls `satella-mta-helper`
+/// once per operation.
 ///
-/// helper 跑完就退出；P2P 组和 `dnsmasq` 留在系统里，所以父进程不能在
-/// helper 退出后就认为组没了。
+/// The helper exits after each run; the P2P group and `dnsmasq` stay in the
+/// system, so the parent process must not assume the group is gone just because
+/// the helper exited.
 pub struct HelperGroupOwner {
     interface: String,
     helper: PathBuf,
@@ -376,7 +390,7 @@ pub struct HelperGroupOwner {
 }
 
 impl HelperGroupOwner {
-    /// 找到 helper，准备用它管理 `interface` 上的组。
+    /// Find the helper, ready to use it to manage the group on `interface`.
     pub fn new(interface: &str) -> anyhow::Result<Self> {
         let helper = resolve_helper_path().ok_or_else(|| {
             anyhow::anyhow!(
@@ -460,13 +474,14 @@ impl GroupOwnerBackend for HelperGroupOwner {
     }
 }
 
-/// helper 的文件名。
+/// File name of the helper.
 const HELPER_NAME: &str = "satella-mta-helper";
 
-/// 找到 `satella-mta-helper`。
+/// Find `satella-mta-helper`.
 ///
-/// 顺序：`SATELLA_MTA_HELPER`、当前可执行文件旁边（`cargo test` 时再上一层
-/// 的 `deps`）、最后是打包安装的 `/usr/libexec`。
+/// Search order: `SATELLA_MTA_HELPER`, next to the current executable (and one
+/// level up from `deps` when running `cargo test`), then the packaged install
+/// location `/usr/libexec`.
 fn resolve_helper_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SATELLA_MTA_HELPER") {
         let path = PathBuf::from(path);
@@ -501,7 +516,8 @@ fn resolve_helper_path() -> Option<PathBuf> {
             return Some(candidate);
         }
 
-        // `cargo test` 从 `target/debug/deps` 跑，helper 在上一层。
+        // `cargo test` runs from `target/debug/deps`, so the helper is one
+        // level up.
         if parent.file_name().is_some_and(|name| name == "deps")
             && let Some(parent) = parent.parent()
         {
@@ -520,7 +536,7 @@ fn resolve_helper_path() -> Option<PathBuf> {
     None
 }
 
-/// 文件存在且带可执行位。
+/// Whether the file exists and has an executable bit set.
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
@@ -529,7 +545,8 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// helper 只接受这样的接口名：`wlan*` 或 `p2p-*`，最长 15 字节。
+/// The helper only accepts interface names of the form `wlan*` or `p2p-*`,
+/// at most 15 bytes long.
 pub fn validate_interface_name(interface: &str) -> anyhow::Result<()> {
     if interface.is_empty() || interface.len() > 15 {
         return Err(anyhow::anyhow!(
@@ -556,7 +573,7 @@ pub fn validate_interface_name(interface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// helper 只接受 2.4 GHz 和 5 GHz 的信道。
+/// The helper only accepts channels in the 2.4 GHz and 5 GHz bands.
 pub fn validate_frequency(frequency: u32) -> anyhow::Result<()> {
     if (2400..=2500).contains(&frequency) || (4900..=5900).contains(&frequency) {
         return Ok(());
@@ -567,9 +584,10 @@ pub fn validate_frequency(frequency: u32) -> anyhow::Result<()> {
     ))
 }
 
-/// 给组所有者的接口配上互传联盟的地址。
+/// Configure the group owner interface with the MTA address.
 ///
-/// P2P 组建立以后 `wpa_supplicant` 可能重置接口，所以地址要在组起来之后再配。
+/// `wpa_supplicant` may reset the interface after the P2P group is created, so
+/// the address has to be configured after the group is up.
 pub async fn configure_go_interface(interface: &str) -> anyhow::Result<()> {
     let address = format!("{GO_ADDRESS}/{GO_PREFIX_LENGTH}");
 
@@ -600,9 +618,10 @@ pub async fn configure_go_interface(interface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 去掉组所有者接口上的地址。
+/// Remove the address from the group owner interface.
 ///
-/// 地址已经不在时也算成功：清理代码会在失败路径上重复调用它。
+/// This counts as success when the address is already gone: cleanup code calls
+/// it repeatedly on failure paths.
 pub async fn remove_go_interface_address(interface: &str) -> anyhow::Result<()> {
     let address = format!("{GO_ADDRESS}/{GO_PREFIX_LENGTH}");
 
@@ -627,24 +646,25 @@ pub async fn remove_go_interface_address(interface: &str) -> anyhow::Result<()> 
     }
 }
 
-/// `ip` 是不是在说“这个地址/接口本来就没了”？
+/// Is `ip` saying that this address or interface was already absent?
 fn is_absent_link_error(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("Cannot assign requested address") || message.contains("Cannot find device")
 }
 
-/// 组所有者上的 DHCP 服务器。
+/// DHCP server on the group owner.
 ///
-/// 接收端加入组以后会先发 DHCP 请求，拿到 `192.168.49.2` 之类的地址，
-/// 再用网关地址 `192.168.49.1` 连我们的 HTTPS 服务器。没有 DHCP，接收端
-/// 会一直停在“正在连接”。
+/// After joining the group, the receiver first sends a DHCP request and gets
+/// an address such as `192.168.49.2`, then uses the gateway address
+/// `192.168.49.1` to connect to our HTTPS server. Without DHCP the receiver
+/// stays stuck at "connecting".
 pub struct DhcpServer {
     interface: String,
     pid: u32,
 }
 
 impl DhcpServer {
-    /// 在接口上启动 `dnsmasq`，只做 DHCP，不做 DNS。
+    /// Start `dnsmasq` on the interface, serving DHCP only, not DNS.
     pub async fn start(interface: &str) -> anyhow::Result<Self> {
         let directory = runtime_directory()?;
 
@@ -652,13 +672,14 @@ impl DhcpServer {
         let _ = std::fs::remove_file(&pid_file);
 
         let args = vec![
-            // 不读系统配置：只跑我们这一个 DHCP 服务器。
+            // Do not read the system configuration: run only this DHCP server.
             "--conf-file=/dev/null".to_owned(),
-            // 不要 DNS，端口 53 留给别人。
+            // No DNS; leave port 53 to everyone else.
             "--port=0".to_owned(),
-            // 组是临时的，租约不用落盘；也避免 dnsmasq 降权后写不了文件。
+            // The group is temporary, so leases do not need to be persisted;
+            // this also avoids write failures after dnsmasq drops privileges.
             "--dhcp-leasefile=/dev/null".to_owned(),
-            // 不降权，保证 pid 文件和 DHCP 套接字都能正常用。
+            // Do not drop privileges, so the pid file and the DHCP socket work.
             "--user=root".to_owned(),
             format!("--interface={interface}"),
             "--bind-interfaces".to_owned(),
@@ -670,7 +691,7 @@ impl DhcpServer {
 
         run_privileged("dnsmasq", &args).await?;
 
-        // dnsmasq 会先 fork 再写 pid 文件，等它真的起来。
+        // dnsmasq forks before writing its pid file; wait until it is really up.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(contents) = std::fs::read_to_string(&pid_file) {
@@ -702,21 +723,23 @@ impl DhcpServer {
         }
     }
 
-    /// `dnsmasq` 的进程号。
+    /// Process ID of `dnsmasq`.
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    /// 停掉 DHCP 服务器。
+    /// Stop the DHCP server.
     pub async fn stop(&self) -> anyhow::Result<()> {
         Self::stop_pid(&self.interface, Some(self.pid)).await
     }
 
-    /// 按 root 拥有的 pid 文件停掉接口上的 `dnsmasq`。
+    /// Stop `dnsmasq` on the interface using the root-owned pid file.
     ///
-    /// `expected_pid` 只用来发现调用方拿错了数字：真正被杀的 PID 永远来自
-    /// pid 文件，所以调用方没法借这个接口去杀别的进程。文件不存在、内容
-    /// 坏掉、或者 PID 已经不是 `dnsmasq` 时都直接跳过，这样清理是幂等的。
+    /// `expected_pid` is only used to detect that the caller passed the wrong
+    /// number: the PID that is actually killed always comes from the pid file,
+    /// so callers cannot use this interface to kill another process. When the
+    /// file is missing, its contents are malformed, or the PID no longer
+    /// belongs to `dnsmasq`, this is skipped, which makes cleanup idempotent.
     pub async fn stop_pid(interface: &str, expected_pid: Option<u32>) -> anyhow::Result<()> {
         let directory = runtime_directory()?;
         let pid_file = directory.join(format!("dnsmasq-{interface}.pid"));
@@ -774,20 +797,22 @@ impl DhcpServer {
     }
 }
 
-/// 这个 PID 现在还是不是 `dnsmasq`？
+/// Is this PID still `dnsmasq`?
 ///
-/// `/proc` 读不到时按“不是”处理：宁可留下一个进程，也不误杀别的程序。
+/// When `/proc` cannot be read, treat it as "no": better to leave a process
+/// behind than to kill the wrong program.
 fn is_dnsmasq(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|comm| comm.trim() == "dnsmasq")
         .unwrap_or(false)
 }
 
-/// 运行一个需要 root 的命令。
+/// Run a command that requires root.
 ///
-/// 顺序是：本来就是 root 就直接跑；否则先试免密的 `sudo -n`；再不行就让
-/// `pkexec` 弹认证框。这样 `satella-cli` 既能在 root 下无感运行，也能在
-/// 普通用户下完成一次提权。
+/// Order: if already root, run it directly; otherwise try passwordless
+/// `sudo -n`; if that fails, let `pkexec` show an authentication dialog. This
+/// lets `satella-cli` run transparently as root and still elevate once as an
+/// ordinary user.
 pub(crate) async fn run_privileged(program: &str, args: &[String]) -> anyhow::Result<String> {
     let path = resolve_program(program);
 
@@ -825,13 +850,13 @@ pub(crate) async fn run_privileged(program: &str, args: &[String]) -> anyhow::Re
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// 当前进程是不是 root。
+/// Whether the current process is root.
 pub fn is_root() -> bool {
-    // SAFETY: geteuid 没有前置条件，也不会失败。
+    // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
 
-/// `sudo -n true` 能不能直接过（即不需要密码）。
+/// Whether `sudo -n true` succeeds directly (that is, without a password).
 async fn sudo_available() -> bool {
     let mut command = Command::new(resolve_program("sudo"));
     command.args(["-n", "true"]).stdin(Stdio::null());
@@ -842,7 +867,7 @@ async fn sudo_available() -> bool {
     )
 }
 
-/// 跑一个命令，超时就杀掉。
+/// Run a command and kill it on timeout.
 async fn output_with_timeout(
     mut command: Command,
     program: &str,
@@ -859,9 +884,10 @@ async fn output_with_timeout(
     }
 }
 
-/// 找到命令的绝对路径。
+/// Find the absolute path of a command.
 ///
-/// `pkexec` 和 `sudo` 在清理过的环境里跑，用绝对路径最稳。
+/// `pkexec` and `sudo` run with a sanitized environment, so absolute paths are
+/// the most reliable choice.
 fn resolve_program(program: &str) -> String {
     if program.contains('/') {
         return program.to_owned();
@@ -877,11 +903,13 @@ fn resolve_program(program: &str) -> String {
     program.to_owned()
 }
 
-/// 放 pid 文件的目录。
+/// Directory that holds the pid files.
 ///
-/// root 下必须落在 `/run`：那个目录 root 拥有、`0700`，pid 文件才可信。
-/// 普通用户创建组时不会走到 DHCP（组所有者本来就要求 root），但如果真
-/// 走到这里，仍然允许退回临时目录。
+/// As root this must be `/run`: that directory is owned by root with mode
+/// `0700`, which is what makes the pid file trustworthy. An ordinary user
+/// creating a group never reaches DHCP (the group owner already requires
+/// root), but if it does, falling back to the temporary directory is still
+/// allowed.
 fn runtime_directory() -> anyhow::Result<PathBuf> {
     let preferred = PathBuf::from("/run/satella-mta");
     match std::fs::create_dir_all(&preferred) {
@@ -910,7 +938,7 @@ fn runtime_directory() -> anyhow::Result<PathBuf> {
     Ok(fallback)
 }
 
-/// 确保 root 用的运行目录只属于 root。
+/// Ensure the runtime directory used by root belongs only to root.
 fn harden_runtime_directory(directory: &Path) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
@@ -936,7 +964,7 @@ fn harden_runtime_directory(directory: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 在 `Interfaces` 属性里找到名为 `interface` 的那个对象路径。
+/// Find the object path named `interface` in the `Interfaces` property.
 async fn find_interface(
     connection: &zbus::Connection,
     interfaces: &OwnedValue,
@@ -955,7 +983,7 @@ async fn find_interface(
     Ok(None)
 }
 
-/// 从 `ao` 类型（`OwnedValue` 里的数组）取出对象路径。
+/// Extract object paths from the `ao` type (an array inside `OwnedValue`).
 fn object_paths_from_value(value: &OwnedValue) -> Vec<String> {
     let Ok(array) = value.downcast_ref::<zbus::zvariant::Array<'_>>() else {
         return Vec::new();
@@ -968,7 +996,7 @@ fn object_paths_from_value(value: &OwnedValue) -> Vec<String> {
         .collect()
 }
 
-/// 从值里取出对象路径。
+/// Extract an object path from a value.
 fn object_path_from_value(value: &OwnedValue) -> Option<String> {
     value
         .downcast_ref::<zbus::zvariant::ObjectPath<'_>>()
@@ -976,7 +1004,7 @@ fn object_path_from_value(value: &OwnedValue) -> Option<String> {
         .map(|path| path.as_str().to_owned())
 }
 
-/// 从值里取出字符串。
+/// Extract a string from a value.
 fn string_from_value(value: &OwnedValue) -> Option<String> {
     value
         .downcast_ref::<zbus::zvariant::Str<'_>>()
@@ -984,7 +1012,7 @@ fn string_from_value(value: &OwnedValue) -> Option<String> {
         .map(|text| text.as_str().to_owned())
 }
 
-/// 从值里取出字节数组并当成文本。
+/// Extract a byte array from a value and treat it as text.
 fn bytes_to_string(value: &OwnedValue) -> Option<String> {
     let array = value.downcast_ref::<zbus::zvariant::Array<'_>>().ok()?;
     let bytes = array
@@ -996,7 +1024,7 @@ fn bytes_to_string(value: &OwnedValue) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// 从值里取出 u16。
+/// Extract a u16 from a value.
 fn u16_from_value(value: &OwnedValue) -> Option<u16> {
     value.downcast_ref::<u16>().ok()
 }

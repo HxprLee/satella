@@ -1,13 +1,13 @@
-//! 日志模块
+//! Logging module
 //!
-//! 提供跨 UI 的统一日志级别和条目定义。
+//! Provides unified log levels and entry definitions across the UI.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// 日志级别
+/// Log level
 ///
-/// 实现了 `PartialOrd` 以便过滤。
+/// Implements `PartialOrd` for filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum LogLevel {
     Error = 0,
@@ -18,7 +18,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// 获取对应的 Emoji 图标
+    /// Get the corresponding emoji icon
     pub fn icon(&self) -> &'static str {
         match self {
             LogLevel::Error => "❌",
@@ -29,7 +29,7 @@ impl LogLevel {
         }
     }
 
-    /// 获取显示名称
+    /// Get the display name
     pub fn name(&self) -> &'static str {
         match self {
             LogLevel::Error => "ERROR",
@@ -51,7 +51,7 @@ impl std::str::FromStr for LogLevel {
             "INFO" => Ok(LogLevel::Info),
             "DEBUG" => Ok(LogLevel::Debug),
             "TRACE" => Ok(LogLevel::Trace),
-            _ => Ok(LogLevel::Info), // 默认回退到 Info，或者返回 Err，这里保持原逻辑宽容处理
+            _ => Ok(LogLevel::Info), // Default back to Info; keep the original lenient behavior rather than returning Err
         }
     }
 }
@@ -62,12 +62,12 @@ impl fmt::Display for LogLevel {
     }
 }
 
-/// 全局日志条目
+/// Global log entry
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub level: LogLevel,
     pub message: String,
-    // 未来可扩展时间戳等字段
+    // May be extended with fields such as a timestamp in the future
     // pub timestamp: SystemTime,
 }
 

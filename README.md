@@ -16,22 +16,33 @@ flowchart TD
   runtimeOrchestrator --> localsendAdapter
   runtimeOrchestrator --> quickshareAdapter
   runtimeOrchestrator --> mtaAdapter
-  localsendAdapter --> unifiedPeerList
-  quickshareAdapter --> unifiedPeerList
-  mtaAdapter --> unifiedPeerList
+
 ```
 
 ## What a frontend gets
 
 - **One device list.** Every adapter discovers at the same time; the runtime
-  merges their streams into one list. Each entry says which protocol it was
-  found on.
+merges their streams into one list. Each entry says which protocol it was
+found on.
 - **One pending-transfer state.** An incoming transfer carries the protocol
-  the *sender* used, so a frontend can badge the request ("LocalSend", "Quick
-  Share", "MTA") and route the accept/reject to the right adapter without
-  knowing the protocols themselves.
+the *sender* used, so a frontend can badge the request ("LocalSend", "Quick
+Share", "MTA") and route the accept/reject to the right adapter without
+knowing the protocols themselves.
 - **One send path.** A send is routed to the adapter that owns the target
-  peer's protocol. The frontend just says "send this file to that peer".
+peer's protocol. The frontend just says "send this file to that peer".
+
+## Protocols working state
+
+### Linux
+
+| Protocols   | Discovery | Advertisement | Send              | Receive |
+| ----------- | --------- | ------------- | ----------------- | ------- |
+| LocalSend   | Works     | Works         | Works             | Works   |
+| Quick Share | Works     | Works         | In-work           | Works   |
+| MTA         | Works     | Works         | Partially (1) (2) | Works   |
+
+1. Sending files via MTA requires root via `pkexec`
+2. Requires Bluetooth pairing confirmation
 
 ## Layout
 
@@ -88,10 +99,58 @@ cargo run -p satella-cli -- send <fingerprint> ./photo.jpg
 
 # Accept incoming transfers into a directory
 cargo run -p satella-cli -- receive ./downloads
+
+# Run the engine in the background, so the device keeps receiving files
+cargo run -p satella-cli -- daemon --dir ./downloads
+
+# Report what the daemon is doing, and stop it
+cargo run -p satella-cli -- status
+cargo run -p satella-cli -- stop
 ```
 
 The harness is the manual counterpart of the UniFFI surface: what it shows is
 what a frontend sees.
+
+### Daemon mode
+
+`satella-cli daemon` starts the same engine as a detached background process.
+It keeps every protocol adapter running, accepts incoming transfers into a
+directory, and survives the terminal it was started from.
+
+| Command | What it does |
+| --- | --- |
+| `daemon [--dir D] [--auto-accept] [--alias NAME]` | Start the background process. `--dir` is where the received files go (the download directory by default). `--auto-accept` takes every transfer without asking. `--alias` is the name this device announces itself with. |
+| `status` | Report whether the daemon runs, which peers it sees and which transfers it handled. |
+| `stop` | Ask the daemon to stop, and remove its files. |
+
+The daemon asks before it takes a transfer. Every incoming transfer shows up
+as a desktop notification with an **Accept** and a **Refuse** button; the
+click decides what happens, and the sender is answered accordingly. The
+notification is the FreeDesktop Desktop Notifications Specification, so it
+looks like every other notification on the desktop.
+
+The daemon does not time the question out. The sender waits for the answer
+and gives up on its own terms, and the notification comes down when the
+transfer ends, so a question that nobody answers dies with the transfer it
+was about.
+
+`--auto-accept` turns the asking off: every transfer is taken as soon as it
+arrives. That is the flag to use on a machine without a session bus, where
+there is no notification to show in the first place. The daemon takes the
+transfers itself when it cannot reach the notification bus at all.
+
+The daemon keeps three files in `~/.cache/satella-cli/`:
+
+| File | What it holds |
+| --- | --- |
+| `satella-cli.pid` | The process id of the daemon, when it started, and where it writes the files. |
+| `satella-cli.state.json` | The peers of every protocol and the transfers the daemon handled. |
+| `satella-cli.log` | The log of the daemon. `RUST_LOG` still applies. |
+
+`status` and `stop` read the pid file and check that the process is really
+there, so a daemon that died does not leave the commands claiming it is up.
+The daemon runs as the user who started it; MTA sends still go through
+`satella-mta-helper` as described in "Platform notes".
 
 ## Building and checking
 
@@ -105,14 +164,14 @@ cargo doc --workspace --no-deps
 ## Platform notes
 
 - **Linux** is the first-class target. LocalSend uses UDP multicast and
-  HTTPS; MTA uses BlueZ over BLE GATT, NetworkManager to join a group, and
-  wpa_supplicant to create the Wi-Fi Direct group when sending; Quick Share
-  uses mDNS.
+HTTPS; MTA uses BlueZ over BLE GATT, NetworkManager to join a group, and
+wpa_supplicant to create the Wi-Fi Direct group when sending; Quick Share
+uses mDNS.
 - **Android** needs the BLE permissions and a foreground service for the
-  background transfer, which is what the Android frontend shell owns. The
-  library itself needs no platform-specific code.
+background transfer, which is what the Android frontend shell owns. The
+library itself needs no platform-specific code.
 - **Windows** is supported for the LocalSend and Quick Share paths. The MTA
-  adapter needs a WinRT BLE implementation, which is not vendored yet.
+adapter needs a WinRT BLE implementation, which is not vendored yet.
 
 MTA sending is the one part that needs privilege: wpa_supplicant's D-Bus API,
 which creates the Wi-Fi Direct group owner that Android receivers require, is

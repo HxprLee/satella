@@ -62,6 +62,43 @@ This crate contains code forked from [Tinnci/cattysend].
   disconnect that permanently blocks autoconnect for the device, so without
   this the interface stayed down after every MTA send. The restore is
   skipped when no connection was active to begin with.
+* `vendor/mta-core/src/ble/security.rs` (new file): holds the BLE link-security
+  helpers — the adapter pairable switch, the ATT single-packet arithmetic
+  (`mtu_for_payload`, `fits_in_single_packet`), and the ATT MTU probe
+  (`wait_for_single_packet_mtu`) that reads BlueZ's
+  `GattCharacteristic1.MTU` through a parallel `bluer` session.
+* `vendor/mta-core/src/ble/client.rs`: the send path no longer registers a
+  Bluetooth pairing agent. Rejecting a pairing request makes BlueZ-as-client
+  wait forever for `ServicesResolved`, so the send died with
+  `Service discovery timed out` while the phone sat on its pairing sheet.
+  Instead the client stops retrying ATT requests that failed for security
+  reasons (`is_security_error`), maps a connect-time pairing stall to
+  `BleClientError::PairingRequired`, and requires the P2P payload to fit one
+  ATT packet — a long write is what makes the peer answer
+  `INSUFFICIENT_ENCRYPTION` and start SMP.
+* `vendor/mta-core/src/ble/server.rs`: the GATT server registers no pairing
+  agent — an agent makes BlueZ run the SMP exchange instead of refusing it
+  outright. It also no longer turns the adapter unpairable: the adapter is
+  shared between the send and receive paths, and refusing the bonding outright
+  means the phone's SMP never completes, so `ServicesResolved` never arrives
+  and the send fails with `Service discovery timed out`.
+* `vendor/mta-core/src/ble/scanner.rs`: restores the adapter's discovery filter
+  after a scan finishes.
+* `vendor/mta-core/src/transfer/receiver_client.rs` and
+  `vendor/mta-core/src/workflow/receiver.rs`: the receive callback is now
+  `async`. The question "shall I take this transfer?" travels with a
+  `oneshot::Sender<bool>`, so the application can take its time before it
+  answers and a refusal becomes possible at all. The synchronous callback
+  could only ever answer "yes" instantly, because the sender gives up
+  waiting for an answer that is not there. `ReceiveRequest` also carries the
+  sender's `task_id`, so an answer reaches the right transfer when two of
+  them arrive at once.
+* All Chinese comments and doc comments under `vendor/mta-core/` were
+  translated to English. The Chinese status and error strings in
+  `vendor/mta-core/src/workflow/` and the lint-reason strings in
+  `vendor/mta-core/src/wifi/tests.rs` were translated as well. No executable
+  logic, protocol constant, API, or test expectation was changed. Unicode
+  test payloads that deliberately contain non-ASCII text were left intact.
 
 Apart from the changes listed above, the Rust sources under
 `vendor/mta-core/src/` are upstream's, unchanged.

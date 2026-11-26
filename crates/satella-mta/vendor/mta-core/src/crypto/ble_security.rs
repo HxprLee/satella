@@ -1,18 +1,18 @@
 //! Cattysend Crypto Module
 //!
-//! 实现与 CatShare (Android) 完全兼容的加密逻辑：
-//! - ECDH (P-256) 密钥交换
-//! - AES-256-CTR 加密（使用固定 IV）
+//! Implements encryption logic fully compatible with CatShare (Android):
+//! - ECDH (P-256) key exchange
+//! - AES-256-CTR encryption (with a fixed IV)
 //!
-//! # 关键兼容性说明
+//! # Key Compatibility Notes
 //!
-//! 1. **密钥格式**: CatShare 使用 Java 的 `ECPublicKey.getEncoded()`，
-//!    返回 X.509 SubjectPublicKeyInfo (SPKI) 格式。我们必须使用相同格式。
+//! 1. **Key format**: CatShare uses Java's `ECPublicKey.getEncoded()`,
+//!    which returns the X.509 SubjectPublicKeyInfo (SPKI) format. We must use the same format.
 //!
-//! 2. **密钥派生**: CatShare 使用 `KeyAgreement.generateSecret("TlsPremasterSecret")`，
-//!    这会返回原始的 ECDH 共享密钥（32 字节），**不使用** HKDF。
+//! 2. **Key derivation**: CatShare uses `KeyAgreement.generateSecret("TlsPremasterSecret")`,
+//!    which returns the raw ECDH shared secret (32 bytes) and does **not** use HKDF.
 //!
-//! 3. **AES IV**: 是字符串 `"0102030405060708"` 的 **ASCII 字节**，不是十六进制。
+//! 3. **AES IV**: this is the **ASCII bytes** of the string `"0102030405060708"`, not hexadecimal.
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::{Engine as _, engine::general_purpose};
@@ -24,60 +24,60 @@ use rand::rngs::OsRng;
 
 type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 
-/// CatShare 使用的固定 IV：字符串 "0102030405060708" 的 ASCII 字节
-/// 实际字节: [0x30, 0x31, 0x30, 0x32, 0x30, 0x33, 0x30, 0x34, 0x30, 0x35, 0x30, 0x36, 0x30, 0x37, 0x30, 0x38]
+/// Fixed IV used by CatShare: the ASCII bytes of the string "0102030405060708"
+/// Actual bytes: [0x30, 0x31, 0x30, 0x32, 0x30, 0x33, 0x30, 0x34, 0x30, 0x35, 0x30, 0x36, 0x30, 0x37, 0x30, 0x38]
 const AES_IV: &[u8; 16] = b"0102030405060708";
 
-/// 从随机数据生成发送方 ID。
+/// Generate a sender ID from random data.
 fn sender_id_from_random_data(random_data: &[u8; 2]) -> String {
     format!("{:02x}{:02x}", random_data[0], random_data[1])
 }
 
-/// BLE 安全上下文 - 管理 ECDH 密钥对
+/// BLE security context - manages an ECDH key pair
 ///
-/// # 生命周期
+/// # Lifecycle
 ///
-/// 每个 `BleSecurity` 实例持有一个临时 ECDH 密钥对。
-/// 调用 `derive_session_key` 后，私钥被消耗（move），实例不可再用。
+/// Each `BleSecurity` instance holds an ephemeral ECDH key pair.
+/// After calling `derive_session_key`, the private key is consumed (moved), and the instance can no longer be used.
 ///
-/// # 与 CatShare 的兼容性
+/// # Compatibility with CatShare
 ///
-/// - 公钥使用 X.509 SPKI DER 格式编码，与 Java `ECPublicKey.getEncoded()` 兼容
-/// - 私钥用于 ECDH 协商，生成的共享密钥直接用于 AES（无 HKDF）
+/// - The public key is encoded in X.509 SPKI DER format, compatible with Java `ECPublicKey.getEncoded()`
+/// - The private key is used for ECDH negotiation; the resulting shared secret is used directly for AES (no HKDF)
 pub struct BleSecurity {
     secret: EphemeralSecret,
     public_key_b64: String,
 }
 
-/// 会话加密器 - 使用 ECDH 派生的共享密钥进行 AES 加解密
+/// Session cipher - performs AES encryption/decryption using a shared secret derived via ECDH
 ///
-/// # 加密算法
+/// # Encryption Algorithm
 ///
-/// - 算法: AES-256-CTR (NoPadding)
-/// - IV: 固定 ASCII 字符串 `"0102030405060708"` (16 bytes)
-/// - 密钥: ECDH 原始共享密钥 (32 bytes)
+/// - Algorithm: AES-256-CTR (NoPadding)
+/// - IV: fixed ASCII string `"0102030405060708"` (16 bytes)
+/// - Key: raw ECDH shared secret (32 bytes)
 pub struct SessionCipher {
     key: [u8; 32],
 }
 
 impl BleSecurity {
-    /// 生成本地 ECDH 密钥对
+    /// Generate a local ECDH key pair
     ///
-    /// # 公钥格式
+    /// # Public Key Format
     ///
-    /// 公钥使用 X.509 SubjectPublicKeyInfo (SPKI) DER 格式，
-    /// 与 Java `ECPublicKey.getEncoded()` 返回的格式一致。
-    /// 这是确保与 CatShare 互操作的关键。
+    /// The public key uses the X.509 SubjectPublicKeyInfo (SPKI) DER format,
+    /// matching the format returned by Java `ECPublicKey.getEncoded()`.
+    /// This is the key to ensuring interoperability with CatShare.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 如果 SPKI 编码失败（极少发生），返回错误。
+    /// Returns an error if SPKI encoding fails (very rare).
     pub fn new() -> anyhow::Result<Self> {
         let secret = EphemeralSecret::random(&mut OsRng);
         let public_key = secret.public_key();
 
-        // 使用 X.509 SPKI DER 格式编码公钥
-        // 这与 Java ECPublicKey.getEncoded() 返回的格式一致
+        // Encode the public key using the X.509 SPKI DER format
+        // This matches the format returned by Java ECPublicKey.getEncoded()
         let spki_der = public_key
             .to_public_key_der()
             .map_err(|e| anyhow::anyhow!("Failed to encode public key as SPKI: {}", e))?;
@@ -94,28 +94,28 @@ impl BleSecurity {
         })
     }
 
-    /// 获取 Base64 编码的公钥（用于 DeviceInfo.key）
+    /// Get the Base64-encoded public key (used for DeviceInfo.key)
     ///
-    /// 返回的字符串可直接用于 BLE GATT STATUS 特征中的 DeviceInfo JSON。
+    /// The returned string can be used directly in the DeviceInfo JSON in the BLE GATT STATUS characteristic.
     pub fn get_public_key(&self) -> &str {
         &self.public_key_b64
     }
 
-    /// 使用对方公钥派生会话密钥
+    /// Derive the session key using the peer's public key
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `peer_pub_key_b64`: 对方公钥的 Base64 编码（SPKI 或 SEC1 格式均可）
+    /// - `peer_pub_key_b64`: Base64 encoding of the peer's public key (SPKI or SEC1 format accepted)
     ///
-    /// # 兼容性说明
+    /// # Compatibility Notes
     ///
-    /// - 支持解析 X.509 SPKI 格式（Java ECPublicKey）
-    /// - 同时支持 SEC1 uncompressed 格式（65 字节，0x04 前缀）作为后备
-    /// - 直接使用 ECDH 原始共享密钥，不做 HKDF 处理
+    /// - Supports parsing the X.509 SPKI format (Java ECPublicKey)
+    /// - Also supports the SEC1 uncompressed format (65 bytes, 0x04 prefix) as a fallback
+    /// - Uses the raw ECDH shared secret directly, with no HKDF processing
     ///
-    /// # 消耗
+    /// # Consumption
     ///
-    /// 此方法消耗 `self`，因为 ECDH 私钥应该只用一次。
+    /// This method consumes `self`, because the ECDH private key should only be used once.
     pub fn derive_session_key(self, peer_pub_key_b64: &str) -> anyhow::Result<SessionCipher> {
         let peer_pub_bytes = general_purpose::STANDARD.decode(peer_pub_key_b64)?;
 
@@ -125,15 +125,15 @@ impl BleSecurity {
             peer_pub_bytes.first().unwrap_or(&0)
         );
 
-        // 尝试两种格式解析公钥
+        // Try parsing the public key in both formats
         let peer_public = Self::parse_public_key(&peer_pub_bytes)?;
 
-        // ECDH 密钥协商
+        // ECDH key agreement
         let shared_secret = self.secret.diffie_hellman(&peer_public);
 
-        // **关键**: 直接使用原始共享密钥，不做 HKDF 处理
-        // CatShare 的 Java 代码: agreement.generateSecret("TlsPremasterSecret")
-        // 返回 32 字节的原始 ECDH 共享密钥
+        // **Key point**: use the raw shared secret directly, with no HKDF processing
+        // CatShare's Java code: agreement.generateSecret("TlsPremasterSecret")
+        // returns the 32-byte raw ECDH shared secret
         let raw_secret = shared_secret.raw_secret_bytes();
 
         let mut key = [0u8; 32];
@@ -144,10 +144,10 @@ impl BleSecurity {
         Ok(SessionCipher { key })
     }
 
-    /// 解析对方公钥（支持 SPKI 和 SEC1 格式）
+    /// Parse the peer's public key (supports SPKI and SEC1 formats)
     fn parse_public_key(bytes: &[u8]) -> anyhow::Result<PublicKey> {
-        // 首先尝试 SPKI 格式（Java ECPublicKey.getEncoded()）
-        // SPKI 格式通常以 0x30 (SEQUENCE) 开头
+        // First try the SPKI format (Java ECPublicKey.getEncoded())
+        // The SPKI format usually starts with 0x30 (SEQUENCE)
         if bytes.first() == Some(&0x30) {
             use p256::pkcs8::DecodePublicKey;
             if let Ok(pk) = PublicKey::from_public_key_der(bytes) {
@@ -156,7 +156,7 @@ impl BleSecurity {
             }
         }
 
-        // 然后尝试 SEC1 uncompressed 格式（65 字节，0x04 前缀）
+        // Then try the SEC1 uncompressed format (65 bytes, 0x04 prefix)
         if bytes.len() == 65
             && bytes[0] == 0x04
             && let Ok(pk) = PublicKey::from_sec1_bytes(bytes)
@@ -165,44 +165,44 @@ impl BleSecurity {
             return Ok(pk);
         }
 
-        // 最后尝试作为原始 SPKI（某些实现可能不以 0x30 开头）
+        // Finally try as raw SPKI (some implementations may not start with 0x30)
         use p256::pkcs8::DecodePublicKey;
         PublicKey::from_public_key_der(bytes)
             .map_err(|e| anyhow::anyhow!("Invalid public key format: {}", e))
     }
 }
 
-/// 会话加密器引用（用于借用场景）
+/// Session cipher reference (for borrowed scenarios)
 pub struct SessionCipherRef<'a> {
     key: &'a [u8; 32],
 }
 
 impl SessionCipher {
-    /// 从原始密钥创建会话加密器（用于测试）
+    /// Create a session cipher from a raw key (for testing)
     #[cfg(test)]
     pub fn new(key: [u8; 32]) -> Self {
         Self { key }
     }
 
-    /// 获取借用的加密器引用
+    /// Get a borrowed cipher reference
     pub fn as_ref(&self) -> SessionCipherRef<'_> {
         SessionCipherRef { key: &self.key }
     }
 
-    /// 使用 AES-256-CTR 加密数据
+    /// Encrypt data using AES-256-CTR
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `data`: 要加密的明文字符串
+    /// - `data`: the plaintext string to encrypt
     ///
-    /// # 返回
+    /// # Returns
     ///
-    /// Base64 编码的密文，可直接用于 JSON 传输。
+    /// Base64-encoded ciphertext, ready for JSON transport.
     ///
-    /// # 兼容性
+    /// # Compatibility
     ///
-    /// - 算法: AES/CTR/NoPadding（与 Java Cipher 一致）
-    /// - IV: 字符串 "0102030405060708" 的 ASCII 字节
+    /// - Algorithm: AES/CTR/NoPadding (consistent with Java Cipher)
+    /// - IV: the ASCII bytes of the string "0102030405060708"
     pub fn encrypt(&self, data: &str) -> anyhow::Result<String> {
         let mut buffer = data.as_bytes().to_vec();
 
@@ -218,20 +218,20 @@ impl SessionCipher {
         Ok(result)
     }
 
-    /// 使用 AES-256-CTR 解密数据
+    /// Decrypt data using AES-256-CTR
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `encoded_data`: Base64 编码的密文
+    /// - `encoded_data`: Base64-encoded ciphertext
     ///
-    /// # 返回
+    /// # Returns
     ///
-    /// 解密后的明文字符串。
+    /// The decrypted plaintext string.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - Base64 解码失败
-    /// - 解密后的数据不是有效 UTF-8
+    /// - Base64 decoding failure
+    /// - The decrypted data is not valid UTF-8
     pub fn decrypt(&self, encoded_data: &str) -> anyhow::Result<String> {
         let mut buffer = general_purpose::STANDARD.decode(encoded_data)?;
 
@@ -249,7 +249,7 @@ impl SessionCipher {
 }
 
 impl SessionCipherRef<'_> {
-    /// 加密数据（借用版本）
+    /// Encrypt data (borrowed version)
     pub fn encrypt(&self, data: &str) -> anyhow::Result<String> {
         let mut buffer = data.as_bytes().to_vec();
         let mut cipher = Aes256Ctr::new(self.key.into(), AES_IV.into());
@@ -257,7 +257,7 @@ impl SessionCipherRef<'_> {
         Ok(general_purpose::STANDARD.encode(buffer))
     }
 
-    /// 解密数据（借用版本）
+    /// Decrypt data (borrowed version)
     pub fn decrypt(&self, encoded_data: &str) -> anyhow::Result<String> {
         let mut buffer = general_purpose::STANDARD.decode(encoded_data)?;
         let mut cipher = Aes256Ctr::new(self.key.into(), AES_IV.into());
@@ -266,42 +266,42 @@ impl SessionCipherRef<'_> {
     }
 }
 
-/// 持久化 BLE 安全上下文 - 支持多次派生会话密钥
+/// Persistent BLE security context - supports deriving session keys multiple times
 ///
-/// 与 `BleSecurity` 不同，此类型使用 `SecretKey` 而非 `EphemeralSecret`，
-/// 可以多次调用 `derive_session_key` 而不消耗实例。
+/// Unlike `BleSecurity`, this type uses `SecretKey` instead of `EphemeralSecret`,
+/// so `derive_session_key` can be called multiple times without consuming the instance.
 ///
-/// # 与 CatShare 的兼容性
+/// # Compatibility with CatShare
 ///
-/// CatShare 使用单例 `BleSecurity`，可多次调用 `deriveSessionKey`。
-/// 此类型模拟该行为，适用于：
-/// - 接收端 GATT Server（需要持有密钥对等待多个连接）
-/// - 需要验证多个发送端的场景
+/// CatShare uses a singleton `BleSecurity` and can call `deriveSessionKey` multiple times.
+/// This type models that behavior and is suitable for:
+/// - The receiver's GATT Server (needs to hold the key pair while waiting for multiple connections)
+/// - Scenarios that need to verify multiple senders
 ///
-/// # 使用示例
+/// # Usage Example
 ///
 /// ```ignore
 /// let security = BleSecurityPersistent::new()?;
 /// let public_key = security.get_public_key().to_string();
 ///
-/// // 可以多次派生会话密钥
+/// // The session key can be derived multiple times
 /// let cipher1 = security.derive_session_key(&sender1_key)?;
 /// let cipher2 = security.derive_session_key(&sender2_key)?;
 /// ```
 pub struct BleSecurityPersistent {
     secret_key: p256::SecretKey,
     public_key_b64: String,
-    /// 发送方 ID：对端用它识别这台设备。
+    /// Sender ID: the peer uses it to identify this device.
     sender_id: String,
 }
 
 impl BleSecurityPersistent {
-    /// 生成新的持久化 ECDH 密钥对
+    /// Generate a new persistent ECDH key pair
     pub fn new() -> anyhow::Result<Self> {
         let secret_key = p256::SecretKey::random(&mut OsRng);
         let public_key = secret_key.public_key();
 
-        // 使用 X.509 SPKI DER 格式编码公钥
+        // Encode the public key using the X.509 SPKI DER format
         let spki_der = public_key
             .to_public_key_der()
             .map_err(|e| anyhow::anyhow!("Failed to encode public key as SPKI: {}", e))?;
@@ -319,11 +319,11 @@ impl BleSecurityPersistent {
         })
     }
 
-    /// 载入或创建持久化的身份。
+    /// Load or create a persistent identity.
     ///
-    /// 身份由两部分组成：ECDH 密钥对和发送方 ID。两者都必须跨重启保持
-    /// 不变，否则对端会把这台设备当成新设备（互传联盟的客户端按广播里的
-    /// 身份去重）。
+    /// The identity consists of two parts: an ECDH key pair and a sender ID. Both must remain
+    /// unchanged across restarts, otherwise the peer will treat this device as a new device
+    /// (the alliance's clients deduplicate devices by the identity in the broadcast).
     pub fn load_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => match Self::parse(&contents) {
@@ -350,7 +350,7 @@ impl BleSecurityPersistent {
         }
     }
 
-    /// 解析身份文件：先是 Base64 的私钥 DER，然后是发送方 ID。
+    /// Parse the identity file: first the Base64 private key DER, then the sender ID.
     fn parse(contents: &str) -> Option<Self> {
         let mut lines = contents.lines();
         let secret_key_b64 = lines.next()?.trim();
@@ -376,7 +376,7 @@ impl BleSecurityPersistent {
         })
     }
 
-    /// 把身份写入文件，只有本人可读。
+    /// Write the identity to a file that only the owner can read.
     fn store(&self, path: &std::path::Path) -> anyhow::Result<()> {
         use std::io::Write;
 
@@ -391,7 +391,7 @@ impl BleSecurityPersistent {
             self.sender_id
         );
 
-        // 先写临时文件再改名，这样中断不会留下半个文件。
+        // Write a temporary file first, then rename it, so an interruption never leaves a half-written file.
         let temp = path.with_extension("tmp");
         {
             let mut file = std::fs::File::create(&temp)?;
@@ -411,26 +411,26 @@ impl BleSecurityPersistent {
         Ok(())
     }
 
-    /// 发送方 ID：对端用它识别这台设备，必须跨重启保持不变。
+    /// Sender ID: the peer uses it to identify this device; it must remain unchanged across restarts.
     pub fn sender_id(&self) -> &str {
         &self.sender_id
     }
 
-    /// 用给定的 ID 创建身份（首次创建时）。
+    /// Create an identity with the given ID (on first creation).
     pub fn with_sender_id(mut self, sender_id: &str) -> Self {
         self.sender_id = sender_id.to_owned();
         self
     }
 
-    /// 获取 Base64 编码的公钥
+    /// Get the Base64-encoded public key
     pub fn get_public_key(&self) -> &str {
         &self.public_key_b64
     }
 
-    /// 使用对方公钥派生会话密钥（不消耗 self）
+    /// Derive the session key using the peer's public key (does not consume self)
     ///
-    /// 与 `BleSecurity::derive_session_key` 不同，此方法借用 `&self`，
-    /// 可以多次调用。
+    /// Unlike `BleSecurity::derive_session_key`, this method borrows `&self`
+    /// and can be called multiple times.
     pub fn derive_session_key(&self, peer_pub_key_b64: &str) -> anyhow::Result<SessionCipher> {
         let peer_pub_bytes = general_purpose::STANDARD.decode(peer_pub_key_b64)?;
 
@@ -440,16 +440,16 @@ impl BleSecurityPersistent {
             peer_pub_bytes.first().unwrap_or(&0)
         );
 
-        // 解析对方公钥
+        // Parse the peer's public key
         let peer_public = BleSecurity::parse_public_key(&peer_pub_bytes)?;
 
-        // 使用 diffie_hellman 函数（不消耗私钥）
+        // Use the diffie_hellman function (does not consume the private key)
         let shared_secret = p256::ecdh::diffie_hellman(
             self.secret_key.to_nonzero_scalar(),
             peer_public.as_affine(),
         );
 
-        // 直接使用原始共享密钥
+        // Use the raw shared secret directly
         let raw_secret = shared_secret.raw_secret_bytes();
 
         let mut key = [0u8; 32];
@@ -465,7 +465,7 @@ impl BleSecurityPersistent {
 mod tests {
     use super::*;
 
-    /// 验证 AES IV 是 ASCII 字符串 "0102030405060708" 的字节表示
+    /// Verify the AES IV is the byte representation of the ASCII string "0102030405060708"
     #[test]
     fn test_aes_iv_is_ascii() {
         assert_eq!(AES_IV, b"0102030405060708");
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(AES_IV[3], 0x32); // '2'
     }
 
-    /// 测试加密解密往返
+    /// Test the encrypt/decrypt round trip
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [0u8; 32];
@@ -488,21 +488,21 @@ mod tests {
         assert_eq!(plaintext, decrypted);
     }
 
-    /// 测试公钥格式为 SPKI (X.509)
+    /// Verify the public key format is SPKI (X.509)
     #[test]
     fn test_public_key_is_spki_format() {
         let security = BleSecurity::new().unwrap();
         let pub_key_b64 = security.get_public_key();
         let pub_key_bytes = general_purpose::STANDARD.decode(pub_key_b64).unwrap();
 
-        // SPKI 格式应该以 0x30 (SEQUENCE) 开头
+        // The SPKI format should start with 0x30 (SEQUENCE)
         assert_eq!(
             pub_key_bytes[0], 0x30,
             "Public key should be SPKI format (starts with 0x30)"
         );
 
-        // SPKI 格式的 P-256 公钥通常是 91 字节
-        // 结构: SEQUENCE { SEQUENCE { OID, OID }, BIT STRING { 0x04 ... } }
+        // A P-256 public key in SPKI format is usually 91 bytes
+        // Structure: SEQUENCE { SEQUENCE { OID, OID }, BIT STRING { 0x04 ... } }
         assert!(
             pub_key_bytes.len() >= 88 && pub_key_bytes.len() <= 92,
             "SPKI P-256 public key should be ~91 bytes, got {}",
@@ -510,28 +510,28 @@ mod tests {
         );
     }
 
-    /// 测试 ECDH 密钥协商
+    /// Test ECDH key agreement
     #[test]
     fn test_ecdh_key_agreement() {
-        // 创建两个密钥对
+        // Create two key pairs
         let alice = BleSecurity::new().unwrap();
         let bob = BleSecurity::new().unwrap();
 
         let alice_pub = alice.get_public_key().to_string();
         let bob_pub = bob.get_public_key().to_string();
 
-        // 各自派生会话密钥
+        // Each side derives the session key
         let alice_cipher = alice.derive_session_key(&bob_pub).unwrap();
         let bob_cipher = bob.derive_session_key(&alice_pub).unwrap();
 
-        // 验证共享密钥相同
+        // Verify the shared keys are identical
         assert_eq!(
             alice_cipher.key, bob_cipher.key,
             "Shared secret should be identical"
         );
     }
 
-    /// 测试持久化安全上下文的多次派生
+    /// Test multiple derivations with a persistent security context
     #[test]
     fn test_persistent_security() {
         let persistent = BleSecurityPersistent::new().unwrap();
@@ -542,34 +542,34 @@ mod tests {
         let alice_pub = alice.get_public_key().to_string();
         let bob_pub = bob.get_public_key().to_string();
 
-        // Persistent 与 Alice 协商
+        // Persistent negotiates with Alice
         let cipher_p_alice = persistent.derive_session_key(&alice_pub).unwrap();
         let cipher_alice_p = alice.derive_session_key(&persistent_pub).unwrap();
         assert_eq!(cipher_p_alice.key, cipher_alice_p.key);
 
-        // Persistent 与 Bob 协商 (第二次使用)
+        // Persistent negotiates with Bob (second use)
         let cipher_p_bob = persistent.derive_session_key(&bob_pub).unwrap();
         let cipher_bob_p = bob.derive_session_key(&persistent_pub).unwrap();
         assert_eq!(cipher_p_bob.key, cipher_bob_p.key);
 
-        // 验证两次派生出的密钥不同（因为 peer 不同）
+        // Verify the two derived keys differ (because the peers differ)
         assert_ne!(cipher_p_alice.key, cipher_p_bob.key);
     }
 
-    /// 测试跨格式公钥兼容性
+    /// Test cross-format public key compatibility
     #[test]
     fn test_parse_sec1_public_key() {
-        // 创建一个密钥对并获取 SPKI 格式公钥
+        // Create a key pair and get its SPKI-format public key
         let security = BleSecurity::new().unwrap();
         let spki_b64 = security.get_public_key();
         let spki_bytes = general_purpose::STANDARD.decode(spki_b64).unwrap();
 
-        // 验证可以解析
+        // Verify it can be parsed
         let parsed = BleSecurity::parse_public_key(&spki_bytes);
         assert!(parsed.is_ok(), "Should parse SPKI format");
     }
 
-    /// 身份必须跨重启保持不变，否则对端会把这台设备当成新设备。
+    /// The identity must remain unchanged across restarts, otherwise the peer will treat this device as a new device.
     #[test]
     fn test_identity_survives_a_reload() {
         let dir =
@@ -593,8 +593,8 @@ mod tests {
             "the public key has to survive a reload"
         );
 
-        // 同一个身份派生出的会话密钥必须和之前一致，否则对端会认为
-        // 密钥变了。
+        // Session keys derived from the same identity must match the previous ones,
+        // otherwise the peer will think the key has changed.
         let peer = BleSecurity::new().unwrap();
         assert_eq!(
             first.derive_session_key(peer.get_public_key()).unwrap().key,
@@ -607,7 +607,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 测试空数据加密
+    /// Test encrypting empty data
     #[test]
     fn test_encrypt_empty_string() {
         let key = [42u8; 32];
@@ -619,7 +619,7 @@ mod tests {
         assert_eq!("", decrypted);
     }
 
-    /// 测试大数据加密
+    /// Test encrypting large data
     #[test]
     fn test_encrypt_large_data() {
         let key = [0xAB; 32];
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(plaintext, decrypted);
     }
 
-    /// 测试 Unicode 数据加密
+    /// Test encrypting Unicode data
     #[test]
     fn test_encrypt_unicode() {
         let key = [0xCD; 32];

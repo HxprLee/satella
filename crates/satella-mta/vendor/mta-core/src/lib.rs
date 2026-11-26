@@ -1,53 +1,53 @@
 //! Cattysend Core Library
 //!
-//! 互传联盟协议的核心实现库，与 CatShare (Android) 完全兼容
+//! Core implementation library for the Mutual Transfer Alliance protocol, fully compatible with CatShare (Android)
 //!
-//! # 模块
+//! # Modules
 //!
-//! - **ble**: BLE 扫描、广播、GATT 客户端/服务器
-//! - **crypto**: ECDH 密钥交换和 AES-CTR 加密
-//! - **wifi**: WiFi P2P 热点创建和连接
-//! - **transfer**: HTTP/WebSocket 文件传输
+//! - **ble**: BLE scanning, advertising, GATT client/server
+//! - **crypto**: ECDH key exchange and AES-CTR encryption
+//! - **wifi**: WiFi P2P hotspot creation and connection
+//! - **transfer**: HTTP/WebSocket file transfer
 //!
-//! # 使用示例
+//! # Usage Example
 //!
-//! ## 发送文件
+//! ## Sending Files
 //!
 //! ```ignore
 //! use cattysend_core::{BleScanner, BleClient, WiFiP2pSender, TransferServer};
 //!
-//! // 1. 扫描接收端设备
+//! // 1. Scan for receiver devices
 //! let scanner = BleScanner::new().await?;
 //! let devices = scanner.scan(Duration::from_secs(5)).await?;
 //!
-//! // 2. 创建 WiFi P2P 热点并启动传输服务器
+//! // 2. Create a WiFi P2P hotspot and start the transfer server
 //! let sender = WiFiP2pSender::new("wlan0");
 //! let p2p_info = sender.create_group(8443).await?;
 //!
-//! // 3. 连接到接收端并发送 P2P 信息
+//! // 3. Connect to the receiver and send the P2P info
 //! let ble_client = BleClient::new().await?;
 //! ble_client.connect_and_handshake(&device.address, &p2p_info, "sender_id").await?;
 //!
-//! // 4. 等待接收端连接并传输文件
+//! // 4. Wait for the receiver to connect and transfer files
 //! ```
 //!
-//! ## 接收文件
+//! ## Receiving Files
 //!
 //! ```ignore
 //! use cattysend_core::{GattServer, WiFiP2pReceiver, ReceiverClient};
 //!
-//! // 1. 启动 GATT Server 等待连接
+//! // 1. Start the GATT Server and wait for connections
 //! let server = GattServer::new("02:00:00:00:00:00", "MyDevice")?;
 //! let handle = server.start().await?;
 //!
-//! // 2. 等待收到 P2P 信息
+//! // 2. Wait for the P2P info
 //! let p2p_event = p2p_rx.recv().await?;
 //!
-//! // 3. 连接到发送端热点
+//! // 3. Connect to the sender's hotspot
 //! let receiver = WiFiP2pReceiver::new("wlan0");
 //! let ip = receiver.connect(&p2p_event.p2p_info).await?;
 //!
-//! // 4. 接收文件
+//! // 4. Receive files
 //! let client = ReceiverClient::new(&host_ip, p2p_info.port, output_dir);
 //! client.start(&callback).await?;
 //! ```

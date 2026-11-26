@@ -1,7 +1,7 @@
-//! BLE 广播器
+//! BLE advertiser
 //!
-//! 提供低级别的 BLE 广播和 GATT 服务功能。
-//! 通常应使用更高层的 `GattServer` 代替。
+//! Provides low-level BLE advertising and GATT service functionality.
+//! The higher-level `GattServer` should usually be used instead.
 
 use log::info;
 

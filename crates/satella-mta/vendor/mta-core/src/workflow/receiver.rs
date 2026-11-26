@@ -1,60 +1,70 @@
-//! 接收端工作流
+//! Receiver workflow
 //!
-//! 高层 API 封装完整的接收流程:
-//! 1. 启动 GATT Server 等待连接
-//! 2. 接收 P2P 信息
-//! 3. 连接到发送端 WiFi 热点
-//! 4. 通过 HTTP/WebSocket 接收文件
+//! High-level API wrapping the complete receive flow:
+//! 1. Start the GATT server and wait for a connection
+//! 2. Receive the P2P info
+//! 3. Connect to the sender's Wi-Fi hotspot
+//! 4. Receive files over HTTP/WebSocket
 
 use crate::ble::GattServer;
 use crate::crypto::BleSecurityPersistent;
 use crate::transfer::{ReceiverCallback, ReceiverClient, SendRequest};
 use crate::wifi::WiFiP2pReceiver;
+use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-/// 接收进度回调
+/// Receive progress callback
+#[async_trait]
 pub trait ReceiveProgressCallback: Send + Sync {
-    /// 状态更新
+    /// Status update
     fn on_status(&self, status: &str);
-    /// 收到发送请求，返回是否接受
-    fn on_request(&self, request: &ReceiveRequest) -> bool;
-    /// 进度更新
+    /// Called on a send request; returns whether to accept it
+    ///
+    /// The answer may take a while: the sender waits for it, so an
+    /// implementation that asks the user can wait for the user.
+    async fn on_request(&self, request: &ReceiveRequest) -> bool;
+    /// Progress update
     fn on_progress(&self, received: u64, total: u64);
-    /// 接收完成
+    /// Receive complete
     fn on_complete(&self, files: Vec<PathBuf>);
-    /// 接收失败
+    /// Receive failed
     fn on_error(&self, error: &str);
 }
 
-/// 接收请求信息
+/// Receive request information
 #[derive(Debug, Clone)]
 pub struct ReceiveRequest {
     pub sender_name: String,
     pub file_name: String,
     pub file_count: u32,
     pub total_size: u64,
+    /// The sender's task ID, unique for every transfer.
+    ///
+    /// It is used to match the sender's request with the application's answer.
+    pub task_id: String,
 }
 
-/// 接收选项
+/// Receive options
 pub struct ReceiveOptions {
-    /// 设备名称 (在 BLE 广播中显示)
+    /// Device name (shown in BLE advertising)
     pub device_name: String,
-    /// WiFi 接口名称
+    /// Wi-Fi interface name
     pub wifi_interface: String,
-    /// 文件保存目录
+    /// Directory where files are saved
     pub output_dir: PathBuf,
-    /// 是否自动接受
+    /// Whether to auto-accept
     pub auto_accept: bool,
-    /// 厂商 ID
+    /// Vendor ID
     pub brand_id: crate::config::BrandId,
-    /// 是否支持 5GHz
+    /// Whether 5GHz is supported
     pub supports_5ghz: bool,
-    /// 存放持久身份的路径。
+    /// Path where the persistent identity is stored.
     ///
-    /// 身份（ECDH 密钥对和发送方 ID）必须跨重启保持不变，否则对端会把
-    /// 这台设备当成新设备。`None` 表示不持久化。
+    /// The identity (ECDH key pair and sender ID) has to stay the same across
+    /// restarts, otherwise the peer treats this device as a new one. `None`
+    /// means no persistence.
     pub identity_path: Option<PathBuf>,
 }
 
@@ -74,7 +84,7 @@ impl Default for ReceiveOptions {
     }
 }
 
-/// 接收端工作流
+/// Receiver workflow
 pub struct Receiver {
     options: ReceiveOptions,
     security: Arc<BleSecurityPersistent>,
@@ -82,7 +92,8 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(options: ReceiveOptions) -> anyhow::Result<Self> {
-        // 身份要跨重启保持不变，所以从文件载入，没有文件才新建。
+        // The identity has to stay the same across restarts, so load it from
+        // the file and only create a new one when there is no file.
         let security = match &options.identity_path {
             Some(path) => Arc::new(BleSecurityPersistent::load_or_create(path)?),
             None => Arc::new(BleSecurityPersistent::new()?),
@@ -90,17 +101,17 @@ impl Receiver {
         Ok(Self { options, security })
     }
 
-    /// 开始接收模式
+    /// Starts receive mode
     pub async fn start<C: ReceiveProgressCallback>(
         &self,
         callback: &C,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        callback.on_status("启动接收模式...");
+        callback.on_status("Starting receiver mode...");
 
-        // 获取 MAC 地址
+        // Get the MAC address
         let mac = self.get_mac_address();
 
-        // 启动 GATT Server
+        // Start the GATT server
         let mut gatt_server = GattServer::new(
             mac,
             self.options.device_name.clone(),
@@ -114,53 +125,57 @@ impl Receiver {
         let _handle = gatt_server.start().await?;
 
         callback.on_status(&format!(
-            "正在广播为 '{}'，等待发送端连接...",
+            "Advertising as '{}', waiting for a sender...",
             self.options.device_name
         ));
 
-        // 等待 P2P 信息
+        // Wait for the P2P info
         let p2p_event = p2p_rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("P2P channel closed"))?;
 
-        // P2P 信息已由 GattServer 自动解密（如果提供了公钥）
+        // The P2P info has already been decrypted by the GattServer (when a
+        // public key was provided)
         let p2p_info = p2p_event.p2p_info;
 
         if p2p_event.sender_public_key.is_some() {
-            callback.on_status("已接收并解密 P2P 信息");
+            callback.on_status("Received and decrypted P2P info");
         } else {
-            callback.on_status("已接收 P2P 信息");
+            callback.on_status("Received P2P info");
         }
 
-        callback.on_status(&format!("连接到 WiFi: {}", p2p_info.ssid));
+        callback.on_status(&format!("Connecting to Wi-Fi: {}", p2p_info.ssid));
 
-        // 连接到 WiFi P2P 热点（支持双连接）
+        // Connect to the Wi-Fi P2P hotspot (dual connection supported)
         let mut wifi_receiver = WiFiP2pReceiver::new(&self.options.wifi_interface);
         let local_ip = wifi_receiver.connect(&p2p_info).await?;
 
-        // 显示连接状态
+        // Show the connection status
         if wifi_receiver.is_dual_connected().await {
-            callback.on_status(&format!("✅ 已连接（双连接模式），本地 IP: {}", local_ip));
+            callback.on_status(&format!(
+                "✅ Connected (dual-connection mode), local IP: {}",
+                local_ip
+            ));
         } else {
-            callback.on_status(&format!("✅ 已连接，本地 IP: {}", local_ip));
+            callback.on_status(&format!("✅ Connected, local IP: {}", local_ip));
         }
 
-        // 计算发送端 IP (通常是网关)
+        // Compute the sender IP (usually the gateway)
         let sender_ip = self.get_gateway_ip(&local_ip);
 
         callback.on_status(&format!(
-            "连接到 WebSocket: wss://{}:{}/websocket",
+            "Connecting to WebSocket: wss://{}:{}/websocket",
             sender_ip, p2p_info.port
         ));
 
-        // 创建接收适配器
+        // Create the receiver adapter
         let adapter = ReceiverCallbackAdapter {
             callback,
             auto_accept: self.options.auto_accept,
         };
 
-        // 接收文件
+        // Receive the files
         let client = ReceiverClient::new(
             &sender_ip,
             p2p_info.port as u16,
@@ -169,7 +184,7 @@ impl Receiver {
 
         let files = client.start(&adapter).await?;
 
-        // 断开 WiFi 并清理虚拟接口
+        // Disconnect Wi-Fi and clean up the virtual interface
         wifi_receiver.disconnect().await?;
 
         callback.on_complete(files.clone());
@@ -177,7 +192,7 @@ impl Receiver {
         Ok(files)
     }
 
-    /// 获取 MAC 地址
+    /// Returns the MAC address
     fn get_mac_address(&self) -> String {
         let path = format!("/sys/class/net/{}/address", self.options.wifi_interface);
         std::fs::read_to_string(&path)
@@ -185,9 +200,9 @@ impl Receiver {
             .unwrap_or_else(|_| "02:00:00:00:00:00".to_string())
     }
 
-    /// 从本地 IP 推断网关 IP
+    /// Infers the gateway IP from the local IP
     fn get_gateway_ip(&self, local_ip: &str) -> String {
-        // 通常网关是 x.x.x.1
+        // The gateway is usually x.x.x.1
         let parts: Vec<&str> = local_ip.split('.').collect();
         if parts.len() == 4 {
             format!("{}.{}.{}.1", parts[0], parts[1], parts[2])
@@ -197,14 +212,15 @@ impl Receiver {
     }
 }
 
-/// 接收回调适配器
+/// Receiver callback adapter
 struct ReceiverCallbackAdapter<'a, C: ReceiveProgressCallback> {
     callback: &'a C,
     auto_accept: bool,
 }
 
+#[async_trait]
 impl<C: ReceiveProgressCallback> ReceiverCallback for ReceiverCallbackAdapter<'_, C> {
-    fn on_send_request(&self, request: &SendRequest) -> bool {
+    async fn on_send_request(&self, request: &SendRequest) -> bool {
         if self.auto_accept {
             return true;
         }
@@ -214,9 +230,10 @@ impl<C: ReceiveProgressCallback> ReceiverCallback for ReceiverCallbackAdapter<'_
             file_name: request.file_name.clone(),
             file_count: request.file_count,
             total_size: request.total_size,
+            task_id: request.get_task_id(),
         };
 
-        self.callback.on_request(&req)
+        self.callback.on_request(&req).await
     }
 
     fn on_progress(&self, received: u64, total: u64) {
@@ -232,17 +249,27 @@ impl<C: ReceiveProgressCallback> ReceiverCallback for ReceiverCallbackAdapter<'_
     }
 }
 
-/// 简化的接收回调实现
+/// Simplified receive callback implementation
 pub struct SimpleReceiveCallback {
     tx: mpsc::Sender<ReceiveEvent>,
     auto_accept: bool,
 }
 
-#[derive(Debug, Clone)]
+/// The sender wants to send files.
+///
+/// The application has to answer on `answer`, either accept or refuse. The
+/// sender waits for this answer until it gives up on its own.
+#[derive(Debug)]
 pub enum ReceiveEvent {
     Status(String),
-    Request(ReceiveRequest),
-    Progress { received: u64, total: u64 },
+    Request {
+        request: ReceiveRequest,
+        answer: oneshot::Sender<bool>,
+    },
+    Progress {
+        received: u64,
+        total: u64,
+    },
     Complete(Vec<PathBuf>),
     Error(String),
 }
@@ -254,14 +281,34 @@ impl SimpleReceiveCallback {
     }
 }
 
+#[async_trait]
 impl ReceiveProgressCallback for SimpleReceiveCallback {
     fn on_status(&self, status: &str) {
         let _ = self.tx.try_send(ReceiveEvent::Status(status.to_string()));
     }
 
-    fn on_request(&self, request: &ReceiveRequest) -> bool {
-        let _ = self.tx.try_send(ReceiveEvent::Request(request.clone()));
-        self.auto_accept
+    async fn on_request(&self, request: &ReceiveRequest) -> bool {
+        if self.auto_accept {
+            return true;
+        }
+
+        // The answer travels with the request, so the application can take its
+        // time before it answers.
+        let (answer_tx, answer_rx) = oneshot::channel();
+        if self
+            .tx
+            .try_send(ReceiveEvent::Request {
+                request: request.clone(),
+                answer: answer_tx,
+            })
+            .is_err()
+        {
+            // Nobody is listening; the transfer cannot be answered.
+            return false;
+        }
+
+        // A dropped answer means the application is gone, which is a refusal.
+        answer_rx.await.unwrap_or(false)
     }
 
     fn on_progress(&self, received: u64, total: u64) {

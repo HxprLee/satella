@@ -1,10 +1,10 @@
-//! 发送端工作流
+//! Sender workflow
 //!
-//! 高层 API 封装完整的发送流程:
-//! 1. 创建 WiFi P2P 热点
-//! 2. 启动 HTTP 传输服务器
-//! 3. 通过 BLE 连接接收端并发送 P2P 信息
-//! 4. 等待接收端连接和下载文件
+//! High-level API wrapping the complete send flow:
+//! 1. Create the Wi-Fi P2P hotspot
+//! 2. Start the HTTP transfer server
+//! 3. Connect to the receiver over BLE and send the P2P info
+//! 4. Wait for the receiver to connect and download the files
 
 use crate::ble::{BleClient, DiscoveredDevice};
 use crate::crypto::BleSecurityPersistent;
@@ -14,27 +14,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// 发送进度回调
+/// Send progress callback
 pub trait SendProgressCallback: Send + Sync {
-    /// 状态更新
+    /// Status update
     fn on_status(&self, status: &str);
-    /// 进度更新
+    /// Progress update
     fn on_progress(&self, sent: u64, total: u64);
-    /// 发送完成
+    /// Send complete
     fn on_complete(&self);
-    /// 发送失败
+    /// Send failed
     fn on_error(&self, error: &str);
 }
 
-/// 发送选项
+/// Send options
 pub struct SendOptions {
-    /// WiFi 接口名称
+    /// Wi-Fi interface name
     pub wifi_interface: String,
-    /// 是否使用 5GHz
+    /// Whether to use 5GHz
     pub use_5ghz: bool,
-    /// 发送者名称
+    /// Sender name
     pub sender_name: String,
-    /// 存放持久身份的路径。`None` 表示不持久化。
+    /// Path where the persistent identity is stored. `None` means no
+    /// persistence.
     pub identity_path: Option<PathBuf>,
 }
 
@@ -51,7 +52,7 @@ impl Default for SendOptions {
     }
 }
 
-/// 发送端工作流
+/// Sender workflow
 pub struct Sender {
     options: SendOptions,
     wifi_sender: WiFiP2pSender,
@@ -78,16 +79,16 @@ impl Sender {
         })
     }
 
-    /// 发送文件到指定设备
+    /// Sends files to the specified device
     pub async fn send_to_device<C: SendProgressCallback>(
         &self,
         device: &DiscoveredDevice,
         files: Vec<PathBuf>,
         callback: &C,
     ) -> anyhow::Result<()> {
-        callback.on_status("准备发送...");
+        callback.on_status("Preparing to send...");
 
-        // 准备文件信息
+        // Prepare the file information
         let mut file_entries = Vec::new();
         let mut _total_size: u64 = 0;
 
@@ -100,7 +101,7 @@ impl Sender {
             let size = metadata.len();
             _total_size += size;
 
-            // 猜测 MIME 类型
+            // Guess the MIME type
             let mime_type = mime_guess::from_path(path)
                 .first()
                 .map(|m| m.to_string())
@@ -114,9 +115,9 @@ impl Sender {
             });
         }
 
-        callback.on_status("创建 WiFi 热点...");
+        callback.on_status("Creating Wi-Fi hotspot...");
 
-        // 创建传输任务
+        // Create the transfer task
         let task_id = uuid::Uuid::new_v4().to_string();
         let sender_id = format!("{:04x}", rand::random::<u16>());
 
@@ -127,24 +128,26 @@ impl Sender {
             sender_name: self.options.sender_name.clone(),
         };
 
-        // 启动传输服务器
+        // Start the transfer server
         //
-        // 接收端用 `wss://` 和 `https://` 连接，所以必须是 TLS。
+        // The receiver connects over `wss://` and `https://`, so this must be
+        // TLS.
         let mut server = TransferServer::new(task);
         let port = server.start_tls().await?;
 
-        callback.on_status(&format!("服务器启动于端口 {}", port));
+        callback.on_status(&format!("Server started on port {}", port));
 
-        // 创建 WiFi P2P 热点
+        // Create the Wi-Fi P2P hotspot
         let p2p_info = self.wifi_sender.create_group(port as i32).await?;
 
-        callback.on_status(&format!("热点已创建: {}", p2p_info.ssid));
+        callback.on_status(&format!("Hotspot created: {}", p2p_info.ssid));
 
-        // 连接到接收端 BLE 设备
-        // 热点建好以后的每一步都可能失败；不管成败都要把热点和 DHCP 收掉，
-        // 否则下一次发送会撞上一个残留的组。
+        // Connect to the receiver's BLE device
+        // Every step after the hotspot is up can fail; the hotspot and DHCP
+        // have to be torn down either way, otherwise the next send runs into
+        // a leftover group.
         let transfer = async {
-            callback.on_status("连接到接收端...");
+            callback.on_status("Connecting to receiver...");
 
             let ble_client = BleClient::new().await?.with_security(self.security.clone());
             let _device_info = ble_client
@@ -156,13 +159,13 @@ impl Sender {
                 )
                 .await?;
 
-            callback.on_status("等待接收端连接...");
+            callback.on_status("Waiting for the receiver to connect...");
 
-            // 订阅传输状态
+            // Subscribe to the transfer status
             let mut status_rx = server.subscribe_status_async().await;
 
-            // 等待传输完成或超时
-            let timeout = std::time::Duration::from_secs(300); // 5 分钟超时
+            // Wait for the transfer to complete or time out
+            let timeout = std::time::Duration::from_secs(300); // 5 minute timeout
             let result = tokio::time::timeout(timeout, async {
                 loop {
                     match status_rx.recv().await {
@@ -170,18 +173,18 @@ impl Sender {
                             return Ok(());
                         }
                         Ok(crate::transfer::TransferStatus::Rejected(reason)) => {
-                            return Err(anyhow::anyhow!("接收端拒绝: {}", reason));
+                            return Err(anyhow::anyhow!("The receiver refused: {}", reason));
                         }
                         Ok(crate::transfer::TransferStatus::Transferring { progress }) => {
                             let percent = (progress * 100.0) as u64;
                             callback.on_progress(percent, 100);
                         }
                         Ok(crate::transfer::TransferStatus::Failed(e)) => {
-                            return Err(anyhow::anyhow!("传输失败: {}", e));
+                            return Err(anyhow::anyhow!("Transfer failed: {}", e));
                         }
                         Err(e) => {
-                            // 通道关闭，可能是服务器停止
-                            return Err(anyhow::anyhow!("状态通道错误: {}", e));
+                            // Channel closed, possibly because the server stopped
+                            return Err(anyhow::anyhow!("Status channel error: {}", e));
                         }
                         _ => {}
                     }
@@ -191,7 +194,7 @@ impl Sender {
 
             match result {
                 Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("传输超时")),
+                Err(_) => Err(anyhow::anyhow!("Transfer timed out")),
             }
         }
         .await;
@@ -202,7 +205,7 @@ impl Sender {
 
         match transfer {
             Ok(()) => {
-                callback.on_status("传输完成！");
+                callback.on_status("Transfer complete!");
                 callback.on_complete();
                 Ok(())
             }
@@ -211,7 +214,7 @@ impl Sender {
     }
 }
 
-/// 简化的发送回调实现
+/// Simplified send callback implementation
 pub struct SimpleSendCallback {
     tx: mpsc::Sender<SendEvent>,
 }

@@ -22,6 +22,17 @@ pub enum AdapterEvent {
     Lost(Peer),
     /// An incoming transfer is waiting for a decision.
     ReceivePending(ReceivePending),
+    /// An incoming transfer is no longer waiting for a decision.
+    ///
+    /// The sender gave up, or the session ended. The transfer id is the one
+    /// the pending transfer carried, so the decision that was asked for can
+    /// be withdrawn.
+    ReceiveExpired {
+        /// The protocol the transfer arrived on.
+        protocol: Protocol,
+        /// The identifier of the transfer that expired.
+        transfer_id: String,
+    },
     /// The progress of an outgoing or incoming transfer changed.
     Progress(TransferProgress),
 }

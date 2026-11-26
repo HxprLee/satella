@@ -1,10 +1,10 @@
-//! 互传联盟协议 WebSocket 消息格式
+//! Mutual Transfer Alliance protocol WebSocket message format
 //!
-//! 消息格式: `type:id:name?payload`
-//! - type: "action" 或 "ack"
-//! - id: 消息 ID (数字)
-//! - name: 动作名称
-//! - payload: 可选的 JSON 载荷
+//! Message format: `type:id:name?payload`
+//! - type: "action" or "ack"
+//! - id: message ID (number)
+//! - name: action name
+//! - payload: optional JSON payload
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 static MSG_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\w+):(\d+):(\w+)(\?(.*))?$").unwrap());
 
-/// CatShare 兼容的 WebSocket 消息
+/// CatShare-compatible WebSocket message
 #[derive(Debug, Clone)]
 pub struct WsMessage {
     pub msg_type: String,
@@ -34,7 +34,7 @@ impl std::fmt::Display for WsMessage {
 }
 
 impl WsMessage {
-    /// 解析 CatShare 格式的消息
+    /// Parses a message in CatShare format
     pub fn parse(text: &str) -> Option<Self> {
         let caps = MSG_PATTERN.captures(text)?;
 
@@ -54,7 +54,7 @@ impl WsMessage {
         })
     }
 
-    /// 创建 action 消息
+    /// Creates an action message
     pub fn action(id: u32, name: &str, payload: Option<Value>) -> Self {
         Self {
             msg_type: "action".to_string(),
@@ -64,7 +64,7 @@ impl WsMessage {
         }
     }
 
-    /// 创建 ack 响应消息
+    /// Creates an ack response message
     pub fn ack(id: u32, name: &str, payload: Option<Value>) -> Self {
         Self {
             msg_type: "ack".to_string(),
@@ -74,7 +74,7 @@ impl WsMessage {
         }
     }
 
-    /// 创建版本协商消息
+    /// Creates a version negotiation message
     pub fn version_negotiation(id: u32) -> Self {
         Self::action(
             id,
@@ -86,7 +86,7 @@ impl WsMessage {
         )
     }
 
-    /// 创建状态消息
+    /// Creates a status message
     pub fn status(id: u32, task_id: &str, status_type: i32, reason: &str) -> Self {
         Self::action(
             id,
@@ -101,17 +101,17 @@ impl WsMessage {
     }
 }
 
-/// 发送请求载荷
+/// Send request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendRequest {
-    /// 任务 ID (某些版本可能使用 id 代替 taskId)
+    /// Task ID (some versions may use id instead of taskId)
     #[serde(default)]
     pub task_id: Option<String>,
-    /// 任务 ID 的别名
+    /// Alias for the task ID
     #[serde(default)]
     pub id: Option<String>,
-    /// 发送者 ID (可选)
+    /// Sender ID (optional)
     #[serde(default)]
     pub sender_id: Option<String>,
     pub sender_name: String,
@@ -126,7 +126,7 @@ pub struct SendRequest {
 }
 
 impl SendRequest {
-    /// 获取任务 ID，优先使用 task_id，否则使用 id
+    /// Returns the task ID, preferring task_id and falling back to id
     pub fn get_task_id(&self) -> String {
         self.task_id
             .clone()
@@ -134,7 +134,7 @@ impl SendRequest {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// 获取发送者 ID
+    /// Returns the sender ID
     pub fn get_sender_id(&self) -> String {
         self.sender_id
             .clone()

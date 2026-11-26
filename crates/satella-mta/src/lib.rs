@@ -23,6 +23,7 @@ use satella_core::adapter::{
 };
 use satella_core::peer::{DeviceType, FileEntry, Peer, ReceivePending, SendFile, SendRequest};
 use satella_core::Protocol;
+use tokio::sync::oneshot;
 
 use satella_mta_vendor::ble::{DiscoveredDevice, ScanCallback};
 use satella_mta_vendor::workflow::{ReceiveEvent, ReceiveRequest, SendEvent, SendOptions, Sender};
@@ -45,6 +46,12 @@ pub struct Config {
     /// survive a restart, otherwise the peers see this device as a new one
     /// every time it starts.
     pub identity_path: PathBuf,
+    /// Whether an incoming transfer is taken without asking.
+    ///
+    /// The MTA sender waits for the answer, so this decides whether the
+    /// vendor is asked at all. When it is false, the vendor waits for the
+    /// application to accept or reject the transfer.
+    pub auto_accept: bool,
 }
 
 impl Default for Config {
@@ -54,6 +61,7 @@ impl Default for Config {
             wifi_interface: "wlan0".to_owned(),
             output_dir: dirs::download_dir().unwrap_or_else(|| PathBuf::from(".")),
             identity_path: default_identity_path(),
+            auto_accept: true,
         }
     }
 }
@@ -75,6 +83,10 @@ pub struct MtaAdapter {
 struct InnerState {
     /// The peers seen in the last scan, by their BLE address.
     peers: Arc<std::sync::Mutex<HashMap<String, Peer>>>,
+    /// The vendor's questions, waiting for the application's answer.
+    ///
+    /// The key is the transfer id, so an answer reaches the right transfer.
+    answers: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
 impl MtaAdapter {
@@ -122,26 +134,23 @@ impl ProtocolAdapter for MtaAdapter {
 
     async fn start(&self, events: EventSender) -> AdapterResult<()> {
         let peers = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let answers = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // The receiver runs in the background: it advertises this device over
         // BLE and waits for a sender to offer files.
         {
             let events = events.clone();
             let config = self.config.clone();
+            let answers = answers.clone();
             tokio::spawn(async move {
                 loop {
                     // The vendor's options type is not cloneable, so it is
                     // rebuilt for every attempt.
-                    //
-                    // `auto_accept` is true: the vendor asks synchronously on
-                    // its transfer task, and the sender times out if the
-                    // answer is not instant. The CLI announces the request
-                    // and accepts it right away anyway.
                     let options = satella_mta_vendor::workflow::ReceiveOptions {
                         device_name: config.device_name.clone(),
                         wifi_interface: config.wifi_interface.clone(),
                         output_dir: config.output_dir.clone(),
-                        auto_accept: true,
+                        auto_accept: config.auto_accept,
                         brand_id: satella_mta_vendor::config::BrandId::Unknown,
                         supports_5ghz: true,
                         identity_path: Some(config.identity_path.clone()),
@@ -153,7 +162,9 @@ impl ProtocolAdapter for MtaAdapter {
                     };
 
                     let (callback, mut event_rx) =
-                        satella_mta_vendor::workflow::SimpleReceiveCallback::new(true);
+                        satella_mta_vendor::workflow::SimpleReceiveCallback::new(
+                            config.auto_accept,
+                        );
 
                     let handle = tokio::spawn(async move { receiver.start(&callback).await });
 
@@ -162,8 +173,17 @@ impl ProtocolAdapter for MtaAdapter {
                             ReceiveEvent::Status(status) => {
                                 tracing::debug!(status);
                             }
-                            ReceiveEvent::Request(request) => {
+                            ReceiveEvent::Request { request, answer } => {
                                 let receive_pending = pending_from_request(&request);
+
+                                // The answer is kept until the application
+                                // accepts or rejects the transfer. The vendor
+                                // waits for it, so the sender waits too.
+                                answers
+                                    .lock()
+                                    .unwrap()
+                                    .insert(receive_pending.transfer_id.clone(), answer);
+
                                 if events
                                     .send(AdapterEvent::ReceivePending(receive_pending))
                                     .await
@@ -200,6 +220,24 @@ impl ProtocolAdapter for MtaAdapter {
                     }
 
                     handle.abort();
+
+                    // The receiver is gone, so the transfers it was waiting
+                    // for are gone too. They are refused, and the application
+                    // is told, so it can take the question back.
+                    let unanswered: Vec<String> = {
+                        let mut answers = answers.lock().unwrap();
+                        let ids = answers.keys().cloned().collect();
+                        answers.clear();
+                        ids
+                    };
+                    for id in unanswered {
+                        let _ = events
+                            .send(AdapterEvent::ReceiveExpired {
+                                protocol: Protocol::Mta,
+                                transfer_id: id,
+                            })
+                            .await;
+                    }
                 }
             });
         }
@@ -237,7 +275,7 @@ impl ProtocolAdapter for MtaAdapter {
             });
         }
 
-        *self.state.lock().await = Some(InnerState { peers });
+        *self.state.lock().await = Some(InnerState { peers, answers });
 
         Ok(())
     }
@@ -359,16 +397,42 @@ impl ProtocolAdapter for MtaAdapter {
         outcome
     }
 
-    async fn accept(&self, _pending: ReceivePending, _destination: PathBuf) -> AdapterResult<()> {
-        // The vendor already accepted the transfer when it asked: an instant
-        // yes is the only answer the sender waits for. The CLI accepts every
-        // request it announces, so there is nothing left to decide here.
-        Ok(())
+    async fn accept(&self, pending: ReceivePending, _destination: PathBuf) -> AdapterResult<()> {
+        // The vendor waits for this answer, so accepting is what tells the
+        // sender to go ahead with the files.
+        self.answer(&pending, true).await
     }
 
-    async fn reject(&self, _pending: ReceivePending) -> AdapterResult<()> {
-        // The transfer was already accepted by the time the application sees
-        // the request, so a reject arrives too late to stop it.
+    async fn reject(&self, pending: ReceivePending) -> AdapterResult<()> {
+        // The vendor waits for this answer, so refusing is what tells the
+        // sender that the transfer is not wanted.
+        self.answer(&pending, false).await
+    }
+}
+
+impl MtaAdapter {
+    /// Answers the vendor's question about an incoming transfer.
+    ///
+    /// The answer is what the vendor's transfer task is waiting for, so the
+    /// sender is answered through it.
+    async fn answer(&self, pending: &ReceivePending, accept: bool) -> AdapterResult<()> {
+        let state = self.state.lock().await;
+        let Some(state) = state.as_ref() else {
+            return Err(AdapterError::Startup {
+                protocol: Protocol::Mta,
+                reason: "the adapter is not running".to_owned(),
+            });
+        };
+
+        let Some(answer) = state.answers.lock().unwrap().remove(&pending.transfer_id) else {
+            return Err(AdapterError::Transfer {
+                protocol: Protocol::Mta,
+                reason: "the transfer is no longer waiting for a decision".to_owned(),
+            });
+        };
+
+        // A dropped answer means the vendor gave up on its own.
+        let _ = answer.send(accept);
         Ok(())
     }
 }
@@ -384,7 +448,13 @@ fn pending_from_request(request: &ReceiveRequest) -> ReceivePending {
 
     ReceivePending {
         protocol: Protocol::Mta,
-        transfer_id: format!("{}:{}", request.sender_name, request.file_name),
+        // The task id is unique per transfer, so the answer reaches the right
+        // transfer when two of them arrive at once.
+        transfer_id: if request.task_id.is_empty() {
+            format!("{}:{}", request.sender_name, request.file_name)
+        } else {
+            request.task_id.clone()
+        },
         sender: peer,
         files: vec![FileEntry {
             name: request.file_name.clone(),

@@ -1,25 +1,25 @@
-//! 集成测试 - 加密与协议兼容性
+//! Integration tests - encryption and protocol compatibility
 //!
-//! 验证 cattysend-core 与 CatShare (Android) 的互操作性。
+//! Verifies interoperability between cattysend-core and CatShare (Android).
 
 use satella_mta_vendor::ble::DeviceInfo;
 use satella_mta_vendor::crypto::BleSecurity;
 use satella_mta_vendor::wifi::P2pInfo;
 
-/// 测试完整的 ECDH 密钥交换流程
+/// Test the complete ECDH key exchange flow
 ///
-/// 模拟发送端和接收端的密钥协商过程
+/// Simulates the key agreement process between a sender and a receiver
 #[test]
 fn test_full_ecdh_handshake() {
-    // 1. 接收端生成密钥对并广播公钥
+    // 1. The receiver generates a key pair and broadcasts the public key
     let receiver = BleSecurity::new().unwrap();
     let receiver_pub_key = receiver.get_public_key().to_string();
 
-    // 2. 发送端生成密钥对
+    // 2. The sender generates a key pair
     let sender = BleSecurity::new().unwrap();
     let sender_pub_key = sender.get_public_key().to_string();
 
-    // 3. 发送端使用接收端公钥派生会话密钥并加密 P2pInfo
+    // 3. The sender derives the session key with the receiver's public key and encrypts the P2pInfo
     let sender_cipher = sender.derive_session_key(&receiver_pub_key).unwrap();
 
     let original_ssid = "DIRECT-test1234";
@@ -30,23 +30,23 @@ fn test_full_ecdh_handshake() {
     let encrypted_psk = sender_cipher.encrypt(original_psk).unwrap();
     let encrypted_mac = sender_cipher.encrypt(original_mac).unwrap();
 
-    // 4. 接收端使用发送端公钥派生会话密钥并解密
+    // 4. The receiver derives the session key with the sender's public key and decrypts
     let receiver_cipher = receiver.derive_session_key(&sender_pub_key).unwrap();
 
     let decrypted_ssid = receiver_cipher.decrypt(&encrypted_ssid).unwrap();
     let decrypted_psk = receiver_cipher.decrypt(&encrypted_psk).unwrap();
     let decrypted_mac = receiver_cipher.decrypt(&encrypted_mac).unwrap();
 
-    // 5. 验证解密结果
+    // 5. Verify the decryption results
     assert_eq!(decrypted_ssid, original_ssid);
     assert_eq!(decrypted_psk, original_psk);
     assert_eq!(decrypted_mac, original_mac);
 }
 
-/// 测试 DeviceInfo 与 CatShare JSON 格式的完全兼容性
+/// Test full compatibility of DeviceInfo with the CatShare JSON format
 #[test]
 fn test_device_info_catshare_compatibility() {
-    // 模拟 CatShare 发送的 DeviceInfo JSON
+    // Simulate the DeviceInfo JSON sent by CatShare
     let catshare_json = r#"{
         "state": 0,
         "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...",
@@ -54,7 +54,7 @@ fn test_device_info_catshare_compatibility() {
         "catShare": 123
     }"#;
 
-    // 解析
+    // Parse
     let device_info: DeviceInfo = serde_json::from_str(catshare_json).unwrap();
 
     assert_eq!(device_info.state, 0);
@@ -65,18 +65,18 @@ fn test_device_info_catshare_compatibility() {
     assert_eq!(device_info.mac, "AA:BB:CC:DD:EE:FF");
     assert_eq!(device_info.cat_share, Some(123));
 
-    // 序列化回去
+    // Serialize back
     let serialized = serde_json::to_string(&device_info).unwrap();
 
-    // 验证 camelCase 命名
+    // Verify camelCase naming
     assert!(serialized.contains("\"catShare\":123"));
     assert!(!serialized.contains("\"cat_share\""));
 }
 
-/// 测试 P2pInfo 与 CatShare JSON 格式的完全兼容性
+/// Test full compatibility of P2pInfo with the CatShare JSON format
 #[test]
 fn test_p2p_info_catshare_compatibility() {
-    // 模拟 CatShare 发送的加密 P2pInfo JSON
+    // Simulate the encrypted P2pInfo JSON sent by CatShare
     let catshare_json = r#"{
         "id": "a1b2",
         "ssid": "ENCRYPTED_BASE64_SSID",
@@ -87,7 +87,7 @@ fn test_p2p_info_catshare_compatibility() {
         "catShare": 1
     }"#;
 
-    // 解析
+    // Parse
     let p2p_info: P2pInfo = serde_json::from_str(catshare_json).unwrap();
 
     assert_eq!(p2p_info.id, Some("a1b2".to_string()));
@@ -98,25 +98,25 @@ fn test_p2p_info_catshare_compatibility() {
     assert_eq!(p2p_info.key, Some("SENDER_PUBLIC_KEY_BASE64".to_string()));
     assert_eq!(p2p_info.cat_share, Some(1));
 
-    // 序列化回去
+    // Serialize back
     let serialized = serde_json::to_string(&p2p_info).unwrap();
 
-    // 验证 camelCase 命名
+    // Verify camelCase naming
     assert!(serialized.contains("\"catShare\":1"));
     assert!(!serialized.contains("\"cat_share\""));
 }
 
-/// 测试完整的 P2pInfo 加密/解密流程
+/// Test the complete P2pInfo encryption/decryption flow
 #[test]
 fn test_p2p_info_encryption_roundtrip() {
-    // 创建密钥对
+    // Create key pairs
     let receiver = BleSecurity::new().unwrap();
     let sender = BleSecurity::new().unwrap();
 
     let receiver_pub = receiver.get_public_key().to_string();
     let sender_pub = sender.get_public_key().to_string();
 
-    // 原始 P2P 信息
+    // Original P2P info
     let original = P2pInfo::new(
         "DIRECT-abcd1234".to_string(),
         "secretpass".to_string(),
@@ -124,7 +124,7 @@ fn test_p2p_info_encryption_roundtrip() {
         9443,
     );
 
-    // 发送端加密
+    // The sender encrypts
     let sender_cipher = sender.derive_session_key(&receiver_pub).unwrap();
     let encrypted = P2pInfo::with_encryption(
         "sender123".to_string(),
@@ -135,42 +135,42 @@ fn test_p2p_info_encryption_roundtrip() {
         sender_pub.clone(),
     );
 
-    // 序列化（模拟 BLE 传输）
+    // Serialize (simulating BLE transfer)
     let json = serde_json::to_string(&encrypted).unwrap();
 
-    // 解析
+    // Parse
     let received: P2pInfo = serde_json::from_str(&json).unwrap();
 
-    // 接收端解密
+    // The receiver decrypts
     let receiver_cipher = receiver.derive_session_key(&sender_pub).unwrap();
 
     let decrypted_ssid = receiver_cipher.decrypt(&received.ssid).unwrap();
     let decrypted_psk = receiver_cipher.decrypt(&received.psk).unwrap();
     let decrypted_mac = receiver_cipher.decrypt(&received.mac).unwrap();
 
-    // 验证
+    // Verify
     assert_eq!(decrypted_ssid, original.ssid);
     assert_eq!(decrypted_psk, original.psk);
     assert_eq!(decrypted_mac, original.mac);
     assert_eq!(received.port, original.port);
 }
 
-/// 测试公钥格式兼容性 (SPKI)
+/// Test public key format compatibility (SPKI)
 #[test]
 fn test_public_key_spki_format() {
     let security = BleSecurity::new().unwrap();
     let pub_key_b64 = security.get_public_key();
 
-    // Base64 解码
+    // Base64 decode
     use base64::Engine;
     let pub_key_bytes = base64::engine::general_purpose::STANDARD
         .decode(pub_key_b64)
         .unwrap();
 
-    // SPKI 格式验证
-    // P-256 SPKI 公钥应该：
-    // 1. 以 0x30 (SEQUENCE) 开头
-    // 2. 长度约 91 字节
+    // SPKI format verification
+    // A P-256 SPKI public key should:
+    // 1. Start with 0x30 (SEQUENCE)
+    // 2. Be about 91 bytes long
     assert_eq!(
         pub_key_bytes[0], 0x30,
         "Public key should be SPKI format (0x30 = SEQUENCE)"

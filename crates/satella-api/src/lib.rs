@@ -398,6 +398,12 @@ impl Engine {
                     pending: Some(pending.into()),
                     progress: None,
                 },
+                AdapterEvent::ReceiveExpired { .. } => EngineEvent {
+                    kind: "receive_expired".to_owned(),
+                    peer: None,
+                    pending: None,
+                    progress: None,
+                },
                 AdapterEvent::Progress(progress) => EngineEvent {
                     kind: "progress".to_owned(),
                     peer: None,

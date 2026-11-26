@@ -15,9 +15,9 @@ impl GattHandler {
 
     /// Decrypt P2P info received via CHAR_P2P
     ///
-    /// CatShare 发送的 P2pInfo 格式：
-    /// - 如果 `key` 字段存在，则 ssid/psk/mac 是加密的
-    /// - 使用发送端的公钥派生会话密钥后解密
+    /// P2pInfo format sent by CatShare:
+    /// - If the `key` field is present, then ssid/psk/mac are encrypted
+    /// - Derive the session key from the sender's public key, then decrypt
     pub fn decrypt_p2p_info(
         encrypted_info: &P2pInfo,
         cipher: &SessionCipher,

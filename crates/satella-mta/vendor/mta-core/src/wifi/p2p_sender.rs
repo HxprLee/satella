@@ -1,21 +1,27 @@
-//! WiFi P2P 发送端 (Group Owner / Hotspot)
+//! WiFi P2P sender (group owner / hotspot)
 //!
-//! 互传联盟的接收端只加入真正的 WiFi P2P 组：它按 BLE 里拿到的 SSID 做
-//! `p2p_connect`，不会去连普通热点。所以发送端必须先用 `wpa_supplicant`
-//! 建一个组所有者，并自己配地址、跑 DHCP。
+//! An MTA receiver only joins a real WiFi P2P group: it uses the SSID received
+//! over BLE to run `p2p_connect` and does not join an ordinary hotspot. The
+//! sender must therefore create a group owner with `wpa_supplicant`, configure
+//! its address, and run DHCP itself.
 //!
-//! # 实现方式
+//! # Implementation
 //!
-//! 1. 以 root 运行时，用 [`InProcessGroupOwner`] 直接创建真正的 P2P 组
-//! 2. 普通用户运行时，用 [`HelperGroupOwner`] 调用 `satella-mta-helper`；
-//!    它只把建组、配地址、起 DHCP 这些 root-only 操作交给 helper
-//! 3. 两者都失败时退回 `NmClient` 普通热点：两个 Satella 设备之间仍然可用
+//! 1. When running as root, use [`InProcessGroupOwner`] to create a real P2P
+//!    group directly.
+//! 2. When running as an ordinary user, use [`HelperGroupOwner`] to call
+//!    `satella-mta-helper`; only the root-only operations (create the group,
+//!    configure the address, start DHCP) are handed to the helper.
+//! 3. If both fail, fall back to a plain `NmClient` hotspot: it still works
+//!    between two Satella devices.
 //!
-//! # 注意事项
+//! # Notes
 //!
-//! - P2P 组所有者要 root（wpa_supplicant 的 D-Bus 接口只允许 root）
-//! - 5GHz 频段优先，建组失败再退 2.4GHz
-//! - helper 每次操作跑完就退出，组和 dnsmasq 要继续留在系统里
+//! - The P2P group owner requires root (wpa_supplicant's D-Bus interface is
+//!   root-only).
+//! - Prefer the 5 GHz band and fall back to 2.4 GHz if group creation fails.
+//! - The helper exits after each operation; the group and dnsmasq must stay in
+//!   the system.
 
 use std::process::Command;
 use std::sync::Arc;
@@ -31,13 +37,13 @@ use crate::wifi::p2p_go::{
     GroupOwnerBackend, HelperGroupOwner, InProcessGroupOwner, P2pGroup, is_root,
 };
 
-/// WiFi P2P 配置
+/// WiFi P2P configuration
 pub struct P2pConfig {
-    /// 网络接口名称 (通常是 wlan0)
+    /// Network interface name (usually wlan0)
     pub interface: String,
-    /// SSID 前缀
+    /// SSID prefix
     pub ssid_prefix: String,
-    /// 是否使用 5GHz
+    /// Whether to use 5 GHz
     pub use_5ghz: bool,
 }
 
@@ -51,14 +57,14 @@ impl Default for P2pConfig {
     }
 }
 
-/// 活动连接信息（用于清理）
+/// Active connection information (used for cleanup)
 enum ActiveHotspot {
-    /// NetworkManager 创建的普通热点。
+    /// A plain hotspot created by NetworkManager.
     NetworkManager {
         connection_name: String,
         _connection_path: Option<String>,
     },
-    /// wpa_supplicant 创建的真正 P2P 组。
+    /// A real P2P group created by wpa_supplicant.
     GroupOwner {
         backend: Box<dyn GroupOwnerBackend>,
         group: P2pGroup,
@@ -69,7 +75,8 @@ pub struct WiFiP2pSender {
     config: P2pConfig,
     nm_client: Arc<Mutex<Option<NmClient>>>,
     active_hotspot: Arc<Mutex<Option<ActiveHotspot>>>,
-    /// 建组之前接口上活动的 WiFi 配置，组拆掉以后要把它连回来。
+    /// WiFi profile that was active on the interface before the group was
+    /// created; it has to be reconnected after the group is torn down.
     previous_wifi_profile: Arc<Mutex<Option<(OwnedObjectPath, String)>>>,
 }
 
@@ -95,7 +102,7 @@ impl WiFiP2pSender {
         }
     }
 
-    /// 初始化 NM 客户端
+    /// Initialize the NetworkManager client
     async fn ensure_nm_client(&self) -> anyhow::Result<()> {
         let mut client = self.nm_client.lock().await;
         if client.is_none() {
@@ -113,10 +120,11 @@ impl WiFiP2pSender {
         Ok(())
     }
 
-    /// 生成随机 SSID 和 PSK
+    /// Generate a random SSID and PSK
     ///
-    /// SSID 必须是 `DIRECT-xx` 形式（`xx` 为两位十六进制）。互传联盟的
-    /// 客户端只扫描这个格式的热点，长一点的随机后缀会被忽略。
+    /// The SSID must have the form `DIRECT-xx` (`xx` is two hexadecimal
+    /// digits). MTA clients only scan for this format; longer random suffixes
+    /// are ignored.
     fn generate_credentials(&self) -> (String, String) {
         let random_bytes: u8 = rand::random();
 
@@ -135,11 +143,11 @@ impl WiFiP2pSender {
         (ssid, psk)
     }
 
-    /// 创建 WiFi P2P 组（组所有者模式）
+    /// Create a WiFi P2P group (group owner mode)
     ///
-    /// 返回 P2P 信息，包含 SSID、密码和端口。
+    /// Returns the P2P information, including the SSID, passphrase, and port.
     pub async fn create_group(&self, port: i32) -> anyhow::Result<P2pInfo> {
-        // 获取 MAC 地址
+        // Get the MAC address
         let mac = self.get_mac_address()?;
 
         match self.create_group_owner().await {
@@ -164,14 +172,15 @@ impl WiFiP2pSender {
 
         let (ssid, psk) = self.generate_credentials();
 
-        // 尝试使用 NmClient (D-Bus) 创建热点
+        // Try to create the hotspot through NmClient (D-Bus)
         match self.create_hotspot_nm(&ssid, &psk).await {
             Ok(_) => {
                 info!("Hotspot created via NetworkManager D-Bus");
             }
             Err(e) => {
-                // 有些网卡不支持 5GHz AP 模式：热点会一直停在 ACTIVATING。
-                // 这种情况退回 2.4GHz 再试一次，而不是直接失败。
+                // Some adapters do not support 5 GHz AP mode: the hotspot stays
+                // in ACTIVATING forever. Retry on 2.4 GHz instead of failing
+                // immediately.
                 if self.config.use_5ghz {
                     warn!("NM D-Bus hotspot failed: {}, retrying on 2.4GHz", e);
                     match self.create_hotspot_nm_with_band(&ssid, &psk, "bg").await {
@@ -195,9 +204,11 @@ impl WiFiP2pSender {
         Ok(P2pInfo::new(ssid, psk, mac, port))
     }
 
-    /// 用当前可用的后端建一个 P2P 组，配好地址并启动 DHCP。
+    /// Create a P2P group with the available backend, configure its address,
+    /// and start DHCP.
     async fn create_group_owner(&self) -> anyhow::Result<(String, String)> {
-        // NetworkManager 还占着接口的话，它稍后激活别的连接会把组拆掉。
+        // If NetworkManager still owns the interface, it can later activate
+        // another connection and tear the group down.
         self.disconnect_from_nm().await;
 
         let backend = self.group_owner_backend().await?;
@@ -223,10 +234,11 @@ impl WiFiP2pSender {
         Ok((ssid, psk))
     }
 
-    /// 选择创建组所有者的后端。
+    /// Choose the backend used to create the group owner.
     ///
-    /// 已经是 root 时留在进程内，硬件探针的行为不变；普通用户则走 helper，
-    /// 这样 BLE、TLS 和身份文件都留在用户空间。
+    /// When already root, stay in-process so the hardware probes behave the
+    /// same; an ordinary user goes through the helper, which keeps BLE, TLS,
+    /// and the identity files in user space.
     async fn group_owner_backend(&self) -> anyhow::Result<Box<dyn GroupOwnerBackend>> {
         if is_root() {
             return Ok(Box::new(
@@ -242,14 +254,15 @@ impl WiFiP2pSender {
         }
     }
 
-    /// 让 NetworkManager 松开接口。
+    /// Make NetworkManager release the interface.
     ///
-    /// 不松开的话，组刚建好 NM 就可能把 `wlan0` 抢回去激活原来的 Wi-Fi，
-    /// P2P 组会被直接拆掉。
+    /// Otherwise NetworkManager can grab `wlan0` back to activate the original
+    /// WiFi as soon as the group is up, tearing the P2P group down.
     ///
-    /// 断开之前先记住接口上活动的是哪个连接：NM 的 `Device.disconnect()`
-    /// 是「用户请求的断开」，会把设备的 autoconnect 永久挡掉，组拆掉以后
-    /// 不会自己连回来。
+    /// Remember which connection was active on the interface before
+    /// disconnecting: NetworkManager's `Device.disconnect()` is a
+    /// "user-requested disconnect" that permanently blocks autoconnect for the
+    /// device, so it will not reconnect by itself after the group is torn down.
     async fn disconnect_from_nm(&self) {
         if let Err(err) = self.ensure_nm_client().await {
             debug!("NetworkManager is not available, leaving the interface alone: {err}");
@@ -263,11 +276,8 @@ impl WiFiP2pSender {
 
         match client.find_wifi_device(Some(&self.config.interface)).await {
             Ok(Some(device)) => {
-                // 必须在断开之前问：断开了就问不到了。
-                match client
-                    .active_wifi_profile(&self.config.interface)
-                    .await
-                {
+                // Ask before disconnecting: once disconnected, it is too late.
+                match client.active_wifi_profile(&self.config.interface).await {
                     Ok(Some((profile, id))) => {
                         info!("Remembering the active WiFi profile {id:?} to restore it later");
                         *self.previous_wifi_profile.lock().await = Some((profile, id));
@@ -298,15 +308,17 @@ impl WiFiP2pSender {
 
         drop(client_guard);
 
-        // 等 NM 真正把接口放下来，再去建组。
+        // Wait until NetworkManager has really released the interface before
+        // creating the group.
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    /// 把建组之前那个 WiFi 连接连回来。
+    /// Reconnect the WiFi connection that was active before the group.
     ///
-    /// NM 在 `Device.disconnect()` 之后不会再自动连接，所以必须显式重新
-    /// 激活原来的配置。发送之前接口本来就没有连接的话，什么都不做——不能
-    /// 擅自把用户连到一个他没选过的网络上。
+    /// NetworkManager does not reconnect automatically after
+    /// `Device.disconnect()`, so the original profile must be activated
+    /// explicitly. If the interface had no connection before sending, do
+    /// nothing: never connect the user to a network they did not choose.
     async fn restore_wifi_connection(&self) -> anyhow::Result<()> {
         let Some((profile, id)) = self.previous_wifi_profile.lock().await.take() else {
             debug!("No WiFi profile to restore");
@@ -322,8 +334,14 @@ impl WiFiP2pSender {
             return Ok(());
         };
 
-        let Some(device) = client.find_wifi_device(Some(&self.config.interface)).await? else {
-            warn!("NetworkManager does not manage {} any more", self.config.interface);
+        let Some(device) = client
+            .find_wifi_device(Some(&self.config.interface))
+            .await?
+        else {
+            warn!(
+                "NetworkManager does not manage {} any more",
+                self.config.interface
+            );
             return Ok(());
         };
 
@@ -336,13 +354,13 @@ impl WiFiP2pSender {
         Ok(())
     }
 
-    /// 使用 NetworkManager D-Bus 创建热点
+    /// Create a hotspot through NetworkManager D-Bus
     async fn create_hotspot_nm(&self, ssid: &str, psk: &str) -> anyhow::Result<()> {
         let band = if self.config.use_5ghz { "a" } else { "bg" };
         self.create_hotspot_nm_with_band(ssid, psk, band).await
     }
 
-    /// 使用 NetworkManager D-Bus 在指定频段创建热点
+    /// Create a hotspot on the given band through NetworkManager D-Bus
     async fn create_hotspot_nm_with_band(
         &self,
         ssid: &str,
@@ -356,37 +374,38 @@ impl WiFiP2pSender {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("NM client not initialized"))?;
 
-        // 先删除可能存在的旧连接
+        // Delete any leftover connection with the same name first
         let conn_name = format!(
             "cattysend-hotspot-{}",
             &ssid[..std::cmp::min(8, ssid.len())]
         );
         let _ = client.delete_connection_by_name(&conn_name).await;
 
-        // 创建热点连接配置
+        // Create the hotspot connection profile
         let conn_path = client
             .create_hotspot(ssid, psk, band, &self.config.interface)
             .await?;
 
-        // 查找设备
+        // Find the device
         let device = client
             .find_wifi_device(Some(&self.config.interface))
             .await?
             .ok_or_else(|| anyhow::anyhow!("WiFi device {} not found", self.config.interface))?;
 
-        // 激活连接
+        // Activate the connection
         let active_conn = client
             .activate_connection(&conn_path.as_ref(), &device)
             .await?;
 
-        // 等待连接状态变为 ACTIVATED。地址是 nm_dbus 里配的
-        // 192.168.49.1/24，shared 模式会在这上面起 DHCP。
+        // Wait for the connection state to become ACTIVATED. The address is
+        // configured in nm_dbus as 192.168.49.1/24, and shared mode starts
+        // DHCP on it.
         client
             .wait_for_activation(&active_conn.as_ref(), Duration::from_secs(15))
             .await?;
         info!("Hotspot activated successfully");
 
-        // 记录活动热点信息（用于清理）
+        // Record the active hotspot information (for cleanup)
         let mut hotspot = self.active_hotspot.lock().await;
         *hotspot = Some(ActiveHotspot::NetworkManager {
             connection_name: conn_name,
@@ -396,7 +415,7 @@ impl WiFiP2pSender {
         Ok(())
     }
 
-    /// 停止 P2P 组
+    /// Stop the P2P group
     pub async fn stop_group(&self) -> anyhow::Result<()> {
         debug!("Stopping P2P group/hotspot");
 
@@ -407,7 +426,7 @@ impl WiFiP2pSender {
             Some(ActiveHotspot::NetworkManager {
                 connection_name, ..
             }) => {
-                // 使用 NM D-Bus 删除连接
+                // Delete the connection through NetworkManager D-Bus
                 if let Ok(()) = self.ensure_nm_client().await {
                     let client_guard = self.nm_client.lock().await;
                     if let Some(client) = client_guard.as_ref() {
@@ -424,8 +443,10 @@ impl WiFiP2pSender {
             None => {}
         }
 
-        // 组没了以后才把 WiFi 连回来：组还在的时候 NM 会和它抢接口，组会被
-        // 直接拆掉。恢复失败只记警告——传输这时已经成功了，不能因此报错。
+        // Reconnect WiFi only after the group is gone: while the group still
+        // exists, NetworkManager competes for the interface and tears it down.
+        // A restore failure is only a warning: the transfer has already
+        // succeeded, so it must not turn into an error.
         if let Err(err) = self.restore_wifi_connection().await {
             warn!("Could not restore the previous WiFi connection: {err:#}");
         }
@@ -436,30 +457,32 @@ impl WiFiP2pSender {
         }
     }
 
-    /// 获取接口 MAC 地址
+    /// Get the interface's MAC address
     ///
-    /// 互传联盟的规范要求发送端提供 P2P 接口的 MAC（接收端拿它和 Wi-Fi
-    /// 组的组所有者地址比对），所以先查 P2P 接口。
+    /// The MTA specification requires the sender to provide the MAC address of
+    /// the P2P interface (the receiver compares it with the group owner address
+    /// of the Wi-Fi group), so check the P2P interface first.
     fn get_mac_address(&self) -> anyhow::Result<String> {
-        // 尝试读取 p2p 接口
+        // Try to read the p2p interface
         let p2p_path = format!("/sys/class/net/p2p-dev-{}/address", self.config.interface);
         if let Ok(mac) = std::fs::read_to_string(&p2p_path) {
             return Ok(mac.trim().to_uppercase());
         }
 
-        // 退回普通接口
+        // Fall back to the ordinary interface
         let path = format!("/sys/class/net/{}/address", self.config.interface);
         if let Ok(mac) = std::fs::read_to_string(&path) {
             return Ok(mac.trim().to_uppercase());
         }
 
-        // 返回默认 MAC
+        // Return the default MAC
         Ok("02:00:00:00:00:00".to_string())
     }
 
-    /// 获取热点的 IP 地址
+    /// Get the hotspot's IP address
     pub fn get_hotspot_ip(&self) -> anyhow::Result<String> {
-        // 两种热点都用 192.168.49.1：这是互传联盟约定的网关地址。
+        // Both hotspot types use 192.168.49.1: this is the gateway address
+        // agreed by MTA.
         let output = Command::new("ip").args(["-o", "addr", "show"]).output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -476,7 +499,7 @@ impl WiFiP2pSender {
             }
         }
 
-        // 返回默认 IP
+        // Return the default IP
         Ok("10.42.0.1".to_string())
     }
 }
@@ -490,7 +513,7 @@ mod tests {
         let sender = WiFiP2pSender::new("wlan0");
         let (ssid, psk) = sender.generate_credentials();
 
-        // 互传联盟的客户端只扫描 `DIRECT-xx` 形式的热点。
+        // MTA clients only scan for hotspots in the `DIRECT-xx` format.
         assert!(ssid.starts_with("DIRECT-"));
         assert_eq!(ssid.len(), 9); // "DIRECT-" (7) + 2 hex chars
         assert!(ssid[7..].chars().all(|c| c.is_ascii_hexdigit()));

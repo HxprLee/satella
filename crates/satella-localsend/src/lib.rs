@@ -483,6 +483,16 @@ impl ProtocolAdapter for LocalSendAdapter {
                         ServerEventV2::PrepareUploadAborted { session_id } => {
                             pending.lock().unwrap().remove(&session_id);
                             sessions.lock().unwrap().remove(&session_id);
+
+                            // The sender gave up before the application
+                            // decided, so the transfer is gone and the
+                            // decision that was asked for can be withdrawn.
+                            let _ = events
+                                .send(AdapterEvent::ReceiveExpired {
+                                    protocol: Protocol::LocalSend,
+                                    transfer_id: session_id,
+                                })
+                                .await;
                         }
                         ServerEventV2::Register { ip, info } => {
                             // A device registered with our HTTP server. That

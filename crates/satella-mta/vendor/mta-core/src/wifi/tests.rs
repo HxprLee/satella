@@ -1,14 +1,14 @@
-//! WiFi 模块测试
+//! WiFi module tests
 //!
-//! 包含 NmClient D-Bus 客户端和 P2P 模块的单元测试
+//! Unit tests for the NmClient D-Bus client and the P2P modules
 
 use super::*;
 
 // ============================================================================
-// P2pInfo 测试
+// P2pInfo tests
 // ============================================================================
 
-/// 验证 P2pInfo 序列化与 CatShare 兼容
+/// Verify that P2pInfo serialization is compatible with CatShare
 #[test]
 fn test_p2p_info_serialization() {
     let info = P2pInfo::new(
@@ -20,14 +20,14 @@ fn test_p2p_info_serialization() {
 
     let json = serde_json::to_string(&info).unwrap();
 
-    // 验证 camelCase 命名
+    // Verify the camelCase naming
     assert!(json.contains("\"ssid\":"));
     assert!(json.contains("\"psk\":"));
     assert!(json.contains("\"mac\":"));
     assert!(json.contains("\"port\":"));
-    assert!(json.contains("\"catShare\":")); // 不是 cat_share
+    assert!(json.contains("\"catShare\":")); // not cat_share
 
-    // 验证值
+    // Verify the values
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["ssid"], "DIRECT-abc");
     assert_eq!(parsed["psk"], "password123");
@@ -36,10 +36,10 @@ fn test_p2p_info_serialization() {
     assert_eq!(parsed["catShare"], 1);
 }
 
-/// 验证 P2pInfo 反序列化与 CatShare 兼容
+/// Verify that P2pInfo deserialization is compatible with CatShare
 #[test]
 fn test_p2p_info_deserialization() {
-    // 模拟 CatShare 发送的加密 P2pInfo
+    // Simulate an encrypted P2pInfo sent by CatShare
     let json = r#"{
         "id": "abcd",
         "ssid": "ENCRYPTED_SSID",
@@ -61,7 +61,7 @@ fn test_p2p_info_deserialization() {
     assert_eq!(info.cat_share, Some(2));
 }
 
-/// 验证 P2pInfo 可选字段被正确跳过
+/// Verify that optional P2pInfo fields are skipped correctly
 #[test]
 fn test_p2p_info_skip_none() {
     let info = P2pInfo::new(
@@ -73,12 +73,12 @@ fn test_p2p_info_skip_none() {
 
     let json = serde_json::to_string(&info).unwrap();
 
-    // id 和 key 是 None，应该被跳过
+    // id and key are None, so they should be skipped
     assert!(!json.contains("\"id\":"));
     assert!(!json.contains("\"key\":"));
 }
 
-/// 验证 with_encryption 构造函数
+/// Verify the with_encryption constructor
 #[test]
 fn test_p2p_info_with_encryption() {
     let info = P2pInfo::with_encryption(
@@ -95,7 +95,7 @@ fn test_p2p_info_with_encryption() {
     assert_eq!(info.cat_share, Some(1));
 }
 
-/// 验证 get_server_url 方法
+/// Verify the get_server_url method
 #[test]
 fn test_p2p_info_get_server_url() {
     let info = P2pInfo::new(
@@ -113,7 +113,7 @@ fn test_p2p_info_get_server_url() {
 }
 
 // ============================================================================
-// WiFiP2pSender 测试
+// WiFiP2pSender tests
 // ============================================================================
 
 #[test]
@@ -128,7 +128,7 @@ fn test_p2p_config_default() {
 #[test]
 fn test_wifi_p2p_sender_new() {
     let sender = WiFiP2pSender::new("wlan1");
-    // 验证可以正确创建，不验证私有方法
+    // Verify that it can be created; private methods are not checked
     drop(sender);
 }
 
@@ -141,12 +141,12 @@ fn test_wifi_p2p_sender_with_config() {
     };
 
     let sender = WiFiP2pSender::with_config(config);
-    // 验证配置正确应用
+    // Verify that the configuration is applied correctly
     drop(sender);
 }
 
 // ============================================================================
-// WiFiP2pReceiver 测试
+// WiFiP2pReceiver tests
 // ============================================================================
 
 #[test]
@@ -166,28 +166,31 @@ fn test_wifi_p2p_receiver_new() {
 }
 
 // ============================================================================
-// check_capabilities 测试
+// check_capabilities tests
 // ============================================================================
 
 #[test]
 fn test_check_capabilities() {
     let (has_nmcli, has_net_raw) = check_capabilities();
 
-    // 这些值取决于系统环境，只验证类型正确
+    // These values depend on the system environment; only the types are checked
     println!("has_nmcli: {}, has_net_raw: {}", has_nmcli, has_net_raw);
 
-    // 在非 root 环境下，至少应该检查到 nmcli (如果安装了)
-    // 不做断言，因为测试环境可能不同
+    // In a non-root environment, nmcli should at least be detected (if installed)
+    // No assertions are made because test environments can differ
 }
 
 // ============================================================================
-// Mock 测试辅助 (供其他测试模块使用)
+// Mock test helpers (used by other test modules)
 // ============================================================================
 
-/// 用于测试的 P2pInfo 工厂
-/// 供其他模块的测试使用
+/// P2pInfo factory for tests
+/// Used by tests in other modules
 #[cfg(test)]
-#[expect(dead_code, reason = "测试辅助函数，供其他模块的集成测试使用")]
+#[expect(
+    dead_code,
+    reason = "Test helper used by the integration tests of other modules"
+)]
 pub fn test_p2p_info() -> P2pInfo {
     P2pInfo::new(
         "DIRECT-test123".to_string(),
@@ -197,10 +200,13 @@ pub fn test_p2p_info() -> P2pInfo {
     )
 }
 
-/// 用于测试的加密 P2pInfo 工厂
-/// 供其他模块的测试使用
+/// Encrypted P2pInfo factory for tests
+/// Used by tests in other modules
 #[cfg(test)]
-#[expect(dead_code, reason = "测试辅助函数，供其他模块的集成测试使用")]
+#[expect(
+    dead_code,
+    reason = "Test helper used by the integration tests of other modules"
+)]
 pub fn test_encrypted_p2p_info() -> P2pInfo {
     P2pInfo::with_encryption(
         "test-sender-id".to_string(),
@@ -213,15 +219,15 @@ pub fn test_encrypted_p2p_info() -> P2pInfo {
 }
 
 // ============================================================================
-// NmClient 测试 (需要系统 D-Bus)
+// NmClient tests (require the system D-Bus)
 // ============================================================================
 
 #[cfg(test)]
 mod nm_dbus_tests {
     use super::nm_dbus::*;
 
-    // 注意: 这些测试需要系统 D-Bus 和 NetworkManager 运行
-    // 在 CI 环境中应该被跳过
+    // Note: these tests require the system D-Bus and a running NetworkManager
+    // They should be skipped in CI environments
 
     #[tokio::test]
     #[ignore = "requires system D-Bus and NetworkManager"]
@@ -232,7 +238,7 @@ mod nm_dbus_tests {
         assert!(!version.is_empty());
         println!("NetworkManager version: {}", version);
 
-        // 版本号应该是类似 "1.42.0" 的格式
+        // The version should look like "1.42.0"
         let parts: Vec<&str> = version.split('.').collect();
         assert!(parts.len() >= 2, "Version should have at least major.minor");
     }
@@ -257,7 +263,7 @@ mod nm_dbus_tests {
     async fn test_find_wifi_device() {
         let client = NmClient::new().await.unwrap();
 
-        // 查找默认 WiFi 设备
+        // Find the default WiFi device
         if let Some(device) = client.find_wifi_device(None).await.unwrap() {
             assert_eq!(device.device_type, device_type::WIFI);
             println!("Found WiFi device: {}", device.interface);
@@ -271,7 +277,7 @@ mod nm_dbus_tests {
     async fn test_find_p2p_device() {
         let client = NmClient::new().await.unwrap();
 
-        // 查找 P2P 设备
+        // Find the P2P device
         if let Some(device) = client.find_p2p_device().await.unwrap() {
             assert_eq!(device.device_type, device_type::WIFI_P2P);
             println!("Found P2P device: {}", device.interface);
@@ -285,13 +291,13 @@ mod nm_dbus_tests {
     async fn test_create_and_delete_connection() {
         let client = NmClient::new().await.unwrap();
 
-        // 创建测试连接 (不激活)
+        // Create a test connection (without activating it)
         let test_name = "cattysend-test-connection";
 
-        // 先删除可能存在的旧连接
+        // Delete any leftover connection with the same name first
         let _ = client.delete_connection_by_name(test_name).await;
 
-        // 创建连接配置
+        // Create the connection profile
         let conn_path = client
             .create_wifi_connection("TestSSID", "testpassword", None)
             .await
@@ -299,7 +305,7 @@ mod nm_dbus_tests {
 
         println!("Created connection: {:?}", conn_path);
 
-        // 删除连接
+        // Delete the connection
         client.delete_connection(&conn_path.as_ref()).await.unwrap();
         println!("Deleted connection");
     }

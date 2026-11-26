@@ -1,15 +1,15 @@
-//! HTTP/HTTPS 传输服务器
+//! HTTP/HTTPS transfer server
 //!
-//! 与 CatShare 兼容的文件传输服务。
+//! File transfer service compatible with CatShare.
 //!
-//! # 功能
+//! # Features
 //!
-//! - HTTPS WebSocket 用于协商和状态同步
-//! - HTTPS GET /download 用于 ZIP 文件下载
+//! - HTTPS WebSocket for negotiation and status synchronization
+//! - HTTPS GET /download for ZIP file downloads
 //!
-//! # 协议
+//! # Protocol
 //!
-//! 使用自定义文本协议 `type:id:name?payload`
+//! Uses the custom text protocol `type:id:name?payload`
 
 use log::{debug, error, info, warn};
 
@@ -38,7 +38,7 @@ pub struct DownloadQuery {
     pub task_id: String,
 }
 
-/// 传输任务
+/// Transfer task
 #[derive(Debug, Clone)]
 pub struct TransferTask {
     pub task_id: String,
@@ -55,7 +55,7 @@ pub struct FileEntry {
     pub mime_type: String,
 }
 
-/// 传输状态
+/// Transfer status
 #[derive(Debug, Clone)]
 pub enum TransferStatus {
     Pending,
@@ -66,13 +66,13 @@ pub enum TransferStatus {
     Failed(String),
 }
 
-/// 服务器状态
+/// Server state
 pub struct TransferServerState {
     pub task: TransferTask,
     pub status_tx: broadcast::Sender<TransferStatus>,
 }
 
-/// 传输服务器
+/// Transfer server
 pub struct TransferServer {
     port: u16,
     state: Arc<Mutex<TransferServerState>>,
@@ -83,29 +83,29 @@ impl TransferServer {
         let (status_tx, _) = broadcast::channel(16);
 
         Self {
-            port: 0, // 使用随机端口
+            port: 0, // use a random port
             state: Arc::new(Mutex::new(TransferServerState { task, status_tx })),
         }
     }
 
-    /// 获取分配的端口
+    /// Returns the assigned port
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// 订阅传输状态更新
+    /// Subscribes to transfer status updates
     pub fn subscribe_status(&self) -> broadcast::Receiver<TransferStatus> {
         let state = self.state.blocking_lock();
         state.status_tx.subscribe()
     }
 
-    /// 异步订阅传输状态更新
+    /// Subscribes to transfer status updates asynchronously
     pub async fn subscribe_status_async(&self) -> broadcast::Receiver<TransferStatus> {
         let state = self.state.lock().await;
         state.status_tx.subscribe()
     }
 
-    /// 启动服务器（HTTP 版本，用于测试）
+    /// Starts the server (HTTP version, for tests)
     pub async fn start(&mut self) -> anyhow::Result<u16> {
         let state = self.state.clone();
 
@@ -128,12 +128,12 @@ impl TransferServer {
         Ok(port)
     }
 
-    /// 启动 WebSocket + HTTP 服务器
+    /// Starts the WebSocket + HTTP server
     pub async fn start_with_websocket(&mut self) -> anyhow::Result<u16> {
         let state = self.state.clone();
         let state_for_ws = self.state.clone();
 
-        // HTTP 服务器
+        // HTTP server
         let app = Router::new()
             .route("/download", get(download_handler))
             .with_state(state);
@@ -142,15 +142,15 @@ impl TransferServer {
         let port = http_listener.local_addr()?.port();
         self.port = port;
 
-        // 启动 HTTP 服务器
+        // Start the HTTP server
         tokio::spawn(async move {
             if let Err(e) = axum::serve(http_listener, app).await {
                 error!("HTTP Server error: {}", e);
             }
         });
 
-        // WebSocket 服务器（在同一端口使用不同路径）
-        // 注意：在生产环境中应该合并到一个服务器
+        // WebSocket server (different path on the same port)
+        // Note: production should merge this into a single server
         let ws_listener = TcpListener::bind(format!("0.0.0.0:{}", port + 1)).await?;
         let ws_port = ws_listener.local_addr()?.port();
 
@@ -173,10 +173,11 @@ impl TransferServer {
         Ok(port)
     }
 
-    /// 启动带 TLS 的传输服务器
+    /// Starts the transfer server with TLS
     ///
-    /// 接收端用 `wss://` 和 `https://` 连接，所以发送端必须提供 TLS。
-    /// 证书是自签名的：接收端不校验它，只校验内容。
+    /// The receiver connects over `wss://` and `https://`, so the sender has
+    /// to provide TLS. The certificate is self-signed: the receiver does not
+    /// validate it and only validates the content.
     pub async fn start_tls(&mut self) -> anyhow::Result<u16> {
         let state = self.state.clone();
 
@@ -248,7 +249,7 @@ async fn handle_websocket_socket(
 
     let mut msg_id: u32 = 0;
 
-    // 发送版本协商
+    // Send version negotiation
     let ver_msg = WsMessage::version_negotiation(msg_id);
     if write
         .send(Message::Text(ver_msg.to_string()))
@@ -278,7 +279,7 @@ async fn handle_websocket_socket(
         match ws_msg.msg_type.as_str() {
             "ack" => {
                 if ws_msg.name == "versionNegotiation" {
-                    // 版本协商完成，发送传输请求
+                    // Version negotiation complete; send the transfer request
                     msg_id += 1;
                     let task = {
                         let s = state.lock().await;
@@ -316,7 +317,7 @@ async fn handle_websocket_socket(
                 }
             }
             "action" => {
-                // 发送 ACK
+                // Send the ACK
                 let ack = WsMessage::ack(ws_msg.id, &ws_msg.name, None);
                 if write.send(Message::Text(ack.to_string())).await.is_err() {
                     break;
@@ -327,12 +328,12 @@ async fn handle_websocket_socket(
                 {
                     let status_type = payload.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
                     if status_type == 1 {
-                        // 传输完成
+                        // Transfer complete
                         info!("Transfer completed successfully");
                         let _ = state.lock().await.status_tx.send(TransferStatus::Completed);
                         break;
                     } else if status_type == 3 {
-                        // 用户拒绝
+                        // User refused
                         info!("Transfer rejected by receiver");
                         let reason = payload
                             .get("reason")
@@ -352,7 +353,7 @@ async fn handle_websocket_socket(
     }
 }
 
-/// 处理 WebSocket 连接
+/// Handles a WebSocket connection
 async fn handle_websocket_connection(
     stream: tokio::net::TcpStream,
     state: Arc<Mutex<TransferServerState>>,
@@ -362,11 +363,11 @@ async fn handle_websocket_connection(
 
     let mut msg_id: u32 = 0;
 
-    // 发送版本协商
+    // Send version negotiation
     let ver_msg = WsMessage::version_negotiation(msg_id);
     write.send(Message::Text(ver_msg.to_string())).await?;
 
-    // 处理消息
+    // Handle messages
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text.to_string(),
@@ -394,7 +395,7 @@ async fn handle_websocket_connection(
         match ws_msg.msg_type.as_str() {
             "ack" => {
                 if ws_msg.name == "versionNegotiation" {
-                    // 版本协商完成，发送传输请求
+                    // Version negotiation complete; send the transfer request
                     msg_id += 1;
                     let task = {
                         let s = state.lock().await;
@@ -426,7 +427,7 @@ async fn handle_websocket_connection(
                 }
             }
             "action" => {
-                // 发送 ACK
+                // Send the ACK
                 let ack = WsMessage::ack(ws_msg.id, &ws_msg.name, None);
                 write.send(Message::Text(ack.to_string())).await?;
 
@@ -435,12 +436,12 @@ async fn handle_websocket_connection(
                 {
                     let status_type = payload.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
                     if status_type == 1 {
-                        // 传输完成
+                        // Transfer complete
                         info!("Transfer completed successfully");
                         let _ = state.lock().await.status_tx.send(TransferStatus::Completed);
                         break;
                     } else if status_type == 3 {
-                        // 用户拒绝
+                        // User refused
                         info!("Transfer rejected by receiver");
                         let reason = payload
                             .get("reason")
@@ -462,7 +463,7 @@ async fn handle_websocket_connection(
     Ok(())
 }
 
-/// 文件下载处理器
+/// File download handler
 async fn download_handler(
     Query(query): Query<DownloadQuery>,
     State(state): State<Arc<Mutex<TransferServerState>>>,
@@ -477,7 +478,7 @@ async fn download_handler(
 
     info!("Download request for task_id={}", task.task_id);
 
-    // 创建 ZIP 文件
+    // Create the ZIP file
     match create_zip_response(&task.files).await {
         Ok(data) => {
             let headers = [

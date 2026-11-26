@@ -1,19 +1,19 @@
-//! GATT Server - 接收端 BLE 广播和服务
+//! GATT Server - receiver-side BLE advertisement and service
 //!
-//! 提供与 CatShare (Android) 兼容的 BLE GATT 服务器实现。
+//! Provides a BLE GATT server implementation compatible with CatShare (Android).
 //!
-//! # 功能
+//! # Features
 //!
-//! - 发布 BLE 广播（与 CatShare 广播格式兼容）
-//! - 提供 GATT 服务包含 STATUS 和 P2P 特征
-//! - 处理发送端的 P2P 信息写入
+//! - Publishes BLE advertisements (compatible with the CatShare advertisement format)
+//! - Provides a GATT service containing the STATUS and P2P characteristics
+//! - Handles P2P info writes from the sender
 //!
-//! # 广播数据格式
+//! # Advertisement data format
 //!
-//! CatShare 兼容的广播包含：
+//! A CatShare-compatible advertisement contains:
 //! - Service UUID: `00003331-0000-1000-8000-008123456789`
-//! - Service Data (0x01FF): 6 字节身份数据
-//! - Scan Response (0xFFFF): 27 字节，包含设备名称和协议版本
+//! - Service Data (0x01FF): 6 bytes of identity data
+//! - Scan Response (0xFFFF): 27 bytes, containing the device name and protocol version
 
 use log::{debug, error, info, trace};
 
@@ -35,19 +35,19 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-/// 从随机数据生成 sender ID
+/// Generate the sender ID from the random data
 fn sender_id_from_random_data(random_data: &[u8; 2]) -> String {
     format!("{:02x}{:02x}", random_data[0], random_data[1])
 }
 
-/// P2P 信息接收事件
+/// P2P info receive event
 #[derive(Debug, Clone)]
 pub struct P2pReceiveEvent {
     pub p2p_info: P2pInfo,
     pub sender_public_key: Option<String>,
 }
 
-/// GATT Server 状态
+/// GATT Server state
 pub struct GattServerState {
     pub device_info: DeviceInfo,
     pub device_info_bytes: Vec<u8>,
@@ -76,19 +76,19 @@ pub struct GattServer {
     state: Arc<Mutex<GattServerState>>,
     p2p_tx: mpsc::Sender<P2pReceiveEvent>,
     p2p_rx: Option<mpsc::Receiver<P2pReceiveEvent>>,
-    /// 随机数据 (2 bytes)，用于 sender ID 和广播身份
+    /// Random data (2 bytes), used for the sender ID and advertisement identity
     random_data: [u8; 2],
     sender_id: String,
     device_name: String,
     security: Option<Arc<BleSecurityPersistent>>,
-    /// 厂商 ID
+    /// Vendor ID
     brand_id: BrandId,
-    /// 是否支持 5GHz
+    /// Whether 5GHz is supported
     supports_5ghz: bool,
 }
 
 impl GattServer {
-    /// 创建新的 GATT Server
+    /// Create a new GATT Server
     pub fn new(
         mac_address: String,
         device_name: String,
@@ -97,7 +97,7 @@ impl GattServer {
         let state = GattServerState::new(mac_address, public_key)?;
 
         let (p2p_tx, p2p_rx) = mpsc::channel(16);
-        // 生成随机数据 (2 bytes)，在整个 GATT Server 生命周期内保持不变
+        // Generate random data (2 bytes) that stays constant for the whole GATT Server lifetime
         let random_data: [u8; 2] = rand::random();
         let sender_id = sender_id_from_random_data(&random_data);
 
@@ -114,7 +114,7 @@ impl GattServer {
         })
     }
 
-    /// 从 AppSettings 创建 GattServer
+    /// Create a GattServer from AppSettings
     pub fn from_settings(
         mac_address: String,
         public_key: String,
@@ -126,10 +126,11 @@ impl GattServer {
         Ok(server)
     }
 
-    /// 设置安全上下文，用于自动解密 P2P 信息
+    /// Set the security context, used to automatically decrypt P2P info
     pub fn with_security(mut self, security: Arc<BleSecurityPersistent>) -> Self {
-        // 广播里的身份（随机数据和发送方 ID）必须和密钥对一样跨重启保持
-        // 不变，否则对端会把这台设备当成新设备。
+        // The identity in the advertisement (random data and sender ID) must stay unchanged
+        // across restarts, just like the key pair; otherwise the peer treats this device as
+        // a new one.
         let sender_id = security.sender_id().to_owned();
         if let Ok(bytes) = hex::decode(&sender_id)
             && bytes.len() == 2
@@ -141,29 +142,29 @@ impl GattServer {
         self
     }
 
-    /// 设置厂商 ID
+    /// Set the vendor ID
     pub fn with_brand(mut self, brand_id: BrandId) -> Self {
         self.brand_id = brand_id;
         self
     }
 
-    /// 设置 5GHz 支持
+    /// Set 5GHz support
     pub fn with_5ghz_support(mut self, supports_5ghz: bool) -> Self {
         self.supports_5ghz = supports_5ghz;
         self
     }
 
-    /// 获取 sender ID
+    /// Get the sender ID
     pub fn sender_id(&self) -> &str {
         &self.sender_id
     }
 
-    /// 获取 P2P 信息接收通道
+    /// Get the P2P info receive channel
     pub fn take_p2p_receiver(&mut self) -> Option<mpsc::Receiver<P2pReceiveEvent>> {
         self.p2p_rx.take()
     }
 
-    /// 启动 GATT 服务
+    /// Start the GATT service
     pub async fn start(&self) -> anyhow::Result<GattServerHandle> {
         debug!("Initializing BLE session...");
         let session = bluer::Session::new().await?;
@@ -175,10 +176,22 @@ impl GattServer {
         debug!("Powering on adapter: {}", adapter_name);
         adapter.set_powered(true).await?;
 
+        // Pairing is not part of the MTA protocol, but do **not** touch the adapter's Pairable
+        // setting here.
+        //
+        // The adapter is shared between sending and receiving: the sender is also a GATT
+        // client using the same adapter. Turning Pairable off makes the kernel reject pairing
+        // requests outright, and the phone (CatShare) initiates SMP itself when establishing
+        // the link — so BlueZ waits for a pairing that never completes, `ServicesResolved`
+        // never arrives, and btleplug reports `Service discovery timed out` after 5 seconds.
+        // Sending then fails completely.
+        //
+        // To get "no pairing dialog", **do not register an agent** (with no agent BlueZ
+        // cannot find one and rejects outright), rather than turning off the adapter.
         let state = self.state.clone();
         let p2p_tx = self.p2p_tx.clone();
 
-        // STATUS 特征 - 只读，返回 DeviceInfo JSON
+        // STATUS characteristic - read-only, returns DeviceInfo JSON
         let state_for_read = state.clone();
         let status_char = Characteristic {
             uuid: STATUS_CHAR_UUID,
@@ -206,7 +219,7 @@ impl GattServer {
             ..Default::default()
         };
 
-        // P2P 特征 - 可写，接收 P2pInfo JSON
+        // P2P characteristic - writable, receives P2pInfo JSON
         let p2p_tx_clone = p2p_tx.clone();
         let security_clone = self.security.clone();
         let p2p_char = Characteristic {
@@ -236,7 +249,7 @@ impl GattServer {
             ..Default::default()
         };
 
-        // 创建 GATT 应用
+        // Create the GATT application
         let app = Application {
             services: vec![Service {
                 uuid: MAIN_SERVICE_UUID,
@@ -254,15 +267,15 @@ impl GattServer {
         let _app_handle = adapter.serve_gatt_application(app).await?;
         debug!("GATT application registered successfully");
 
-        // 构造 Legacy BLE 广播
-        // 关键: secondary_channel: None 强制使用 Legacy Advertising PDUs
+        // Build the Legacy BLE advertisement
+        // Key: secondary_channel: None forces Legacy Advertising PDUs
         let random_data = self.random_data;
 
         let mut service_uuids = BTreeSet::new();
         service_uuids.insert(ADV_SERVICE_UUID);
 
-        // ========== 主广播包数据 (31 bytes max) ==========
-        // 构造身份数据 (Service Data, 约 10 bytes)
+        // ========== Main advertisement packet data (31 bytes max) ==========
+        // Build the identity data (Service Data, about 10 bytes)
         let flag_5ghz: u8 = if self.supports_5ghz { 0x01 } else { 0x00 };
         let brand = self.brand_id.id();
         let capability_short = ((flag_5ghz as u16) << 8) | (brand as u16);
@@ -277,27 +290,27 @@ impl GattServer {
         let mut service_data = std::collections::BTreeMap::new();
         service_data.insert(ident_uuid, ident_payload);
 
-        // ========== 扫描响应包数据 (31 bytes max) ==========
-        // 构造 Name Service Data (27 bytes)
-        // CatShare 格式:
-        //   Byte 0-7:   协议头 (固定为 0)
-        //   Byte 8-9:   Sender ID (与 random_data 相同)
-        //   Byte 10-25: 设备名 (UTF-8, 最多 16 字节, null 填充)
-        //   Byte 26:    协议尾 (0)
+        // ========== Scan response packet data (31 bytes max) ==========
+        // Build the Name Service Data (27 bytes)
+        // CatShare format:
+        //   Byte 0-7:   protocol header (fixed at 0)
+        //   Byte 8-9:   Sender ID (same as random_data)
+        //   Byte 10-25: device name (UTF-8, at most 16 bytes, null padded)
+        //   Byte 26:    protocol trailer (0)
         let mut name_payload = vec![0u8; 27];
-        // 设置 Sender ID (byte 8-9)
+        // Set the Sender ID (bytes 8-9)
         name_payload[8] = random_data[0];
         name_payload[9] = random_data[1];
-        // 设置设备名 (byte 10-25, 最多 16 字节)
+        // Set the device name (bytes 10-25, at most 16 bytes)
         let name_bytes = self.device_name.as_bytes();
         let name_len = name_bytes.len().min(16);
         name_payload[10..10 + name_len].copy_from_slice(&name_bytes[..name_len]);
-        // 如果名字被截断，添加 tab 字符标记 (CatShare 会显示 "...")
+        // If the name was truncated, add a tab character marker (CatShare shows "...")
         if name_bytes.len() > 16 {
             name_payload[25] = b'\t';
         }
 
-        // Name Service Data 使用 UUID 0xFFFF (标准蓝牙基底)
+        // Name Service Data uses UUID 0xFFFF (standard Bluetooth base)
         let name_uuid = uuid::Uuid::from_u128(0x0000_ffff_0000_1000_8000_0080_5f9b_34fb_u128);
         let mut scan_response_service_data = std::collections::BTreeMap::new();
         scan_response_service_data.insert(name_uuid, name_payload);
@@ -306,14 +319,14 @@ impl GattServer {
             advertisement_type: bluer::adv::Type::Peripheral,
             service_uuids,
             service_data,
-            // ⭐ 使用 scan_response_service_data 而不是 local_name
-            // 这需要 BlueZ experimental 功能 (Experimental = true in /etc/bluetooth/main.conf)
+            // ⭐ Use scan_response_service_data instead of local_name
+            // This requires the BlueZ experimental feature (Experimental = true in /etc/bluetooth/main.conf)
             scan_response_service_data,
-            // 不再使用 local_name，因为 CatShare 不读取它
+            // local_name is no longer used because CatShare does not read it
             // local_name: Some(self.device_name.clone()),
             discoverable: Some(true),
-            // 关键: secondary_channel: None 强制 Legacy Advertising
-            // 不设置辅助信道 = 使用主信道 = Legacy PDUs
+            // Key: secondary_channel: None forces Legacy Advertising
+            // Not setting a secondary channel = using the primary channel = Legacy PDUs
             secondary_channel: None,
             ..Default::default()
         };
@@ -338,9 +351,10 @@ impl GattServer {
     }
 }
 
-/// 处理 P2P 特征写入
+/// Handle a P2P characteristic write
 ///
-/// 如果提供 security 且 P2pInfo 包含发送端公钥 (key 字段)，则自动解密 SSID/PSK/MAC 字段。
+/// If `security` is provided and the P2pInfo contains the sender's public key (the `key`
+/// field), the SSID/PSK/MAC fields are decrypted automatically.
 fn process_p2p_write(
     data: &[u8],
     security: Option<&BleSecurityPersistent>,
@@ -358,7 +372,7 @@ fn process_p2p_write(
                 p2p_info.ssid = cipher.decrypt(&p2p_info.ssid).unwrap_or(p2p_info.ssid);
                 p2p_info.psk = cipher.decrypt(&p2p_info.psk).unwrap_or(p2p_info.psk);
                 p2p_info.mac = cipher.decrypt(&p2p_info.mac).unwrap_or(p2p_info.mac);
-                p2p_info.key = None; // 表示已解密
+                p2p_info.key = None; // marks it as decrypted
                 info!("Successfully decrypted P2P info");
             }
             Err(e) => {
@@ -381,7 +395,7 @@ fn process_p2p_write(
     })
 }
 
-/// GATT Server Handle - 保持服务运行
+/// GATT Server Handle - keeps the service running
 pub struct GattServerHandle {
     _adv_handle: bluer::adv::AdvertisementHandle,
     _app_handle: bluer::gatt::local::ApplicationHandle,
@@ -389,9 +403,9 @@ pub struct GattServerHandle {
 }
 
 impl GattServerHandle {
-    /// 等待服务关闭信号
+    /// Wait for a service shutdown signal
     pub async fn wait_for_shutdown(&self) {
-        // 永远等待，直到被 drop
+        // Wait forever, until dropped
         std::future::pending::<()>().await;
     }
 }

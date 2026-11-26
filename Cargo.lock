@@ -3740,14 +3740,20 @@ name = "satella-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
+ "futures-util",
+ "libc",
  "satella-core",
  "satella-localsend",
  "satella-mta",
  "satella-quickshare",
  "satella-runtime",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]

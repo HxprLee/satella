@@ -1,6 +1,6 @@
-//! WebSocket 处理器（旧版本，保留兼容性）
+//! WebSocket handler (legacy version, kept for compatibility)
 //!
-//! 注意：新代码应使用 transfer::protocol::WsMessage
+//! Note: new code should use transfer::protocol::WsMessage
 
 use crate::transfer::protocol::WsMessage;
 use futures_util::{SinkExt, StreamExt};

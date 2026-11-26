@@ -191,8 +191,7 @@ async fn sender_cleans_up_when_ble_fails() {
 async fn sender_restores_wifi_after_the_group_is_torn_down() {
     let client = NmClient::new().await.expect("NM client");
 
-    let Some((_, profile_id)) = client.active_wifi_profile("wlan0").await.expect("profile")
-    else {
+    let Some((_, profile_id)) = client.active_wifi_profile("wlan0").await.expect("profile") else {
         panic!("wlan0 has no active WiFi connection; connect to one first");
     };
     println!("BEFORE profile={profile_id:?}");

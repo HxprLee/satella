@@ -1,18 +1,19 @@
-//! WiFi P2P 模块
+//! WiFi P2P module
 //!
-//! 提供与 CatShare 兼容的 WiFi Direct 功能。
+//! Provides WiFi Direct functionality compatible with CatShare.
 //!
-//! # 模块
+//! # Modules
 //!
-//! - `nm_dbus`: NetworkManager D-Bus 客户端 (推荐)
-//! - `p2p_go`: P2P 组所有者 (发送端, 互传联盟的对端只连 P2P 组)
-//! - `p2p_sender`: P2P 热点创建（发送端）
-//! - `p2p_receiver`: P2P 连接（接收端）
+//! - `nm_dbus`: NetworkManager D-Bus client (recommended)
+//! - `p2p_go`: P2P group owner (sender; MTA peers only join P2P groups)
+//! - `p2p_sender`: P2P hotspot creation (sender)
+//! - `p2p_receiver`: P2P connection (receiver)
 //!
 //! # P2pInfo
 //!
-//! 核心数据结构，用于在 BLE 握手时交换 WiFi 连接信息。
-//! 敏感字段（SSID、PSK、MAC）可以使用 AES-CTR 加密。
+//! Core data structure used to exchange WiFi connection information during the
+//! BLE handshake. Sensitive fields (SSID, PSK, MAC) can be encrypted with
+//! AES-CTR.
 
 pub mod nm_dbus;
 pub mod p2p_go;
@@ -26,23 +27,23 @@ pub use nm_dbus::NmClient;
 pub use p2p_receiver::{P2pReceiverConfig, WiFiP2pReceiver};
 pub use p2p_sender::{P2pConfig, WiFiP2pSender};
 
-/// 检查进程是否具有必要的权限
+/// Check whether the process has the necessary permissions
 ///
-/// 返回 (has_nmcli, has_net_raw)
-/// - has_nmcli: 系统中是否安装了 NetworkManager (nmcli)
-/// - has_net_raw: 是否有 CAP_NET_RAW (用于 BLE 扫描)
+/// Returns (has_nmcli, has_net_raw)
+/// - has_nmcli: whether NetworkManager (nmcli) is installed on the system
+/// - has_net_raw: whether the process has CAP_NET_RAW (used for BLE scanning)
 pub fn check_capabilities() -> (bool, bool) {
     let mut has_nmcli = false;
     let mut has_net_raw = false;
 
-    // 检查是否是 root
+    // Check whether we are root
     unsafe {
         if libc::geteuid() == 0 {
             return (true, true);
         }
     }
 
-    // 检查 CAP_NET_RAW (用于 BLE 扫描)
+    // Check CAP_NET_RAW (used for BLE scanning)
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if line.starts_with("CapEff:")
@@ -55,7 +56,7 @@ pub fn check_capabilities() -> (bool, bool) {
         }
     }
 
-    // 检查 nmcli 是否可用
+    // Check whether nmcli is available
     if let Ok(output) = std::process::Command::new("nmcli")
         .arg("--version")
         .output()
@@ -66,9 +67,9 @@ pub fn check_capabilities() -> (bool, bool) {
     (has_nmcli, has_net_raw)
 }
 
-/// P2pInfo - 与 CatShare 的 P2pInfo 完全兼容
+/// P2pInfo - fully compatible with CatShare's P2pInfo
 ///
-/// CatShare Kotlin 定义:
+/// CatShare Kotlin definition:
 /// ```kotlin
 /// data class P2pInfo(
 ///     val id: String?,
@@ -81,15 +82,15 @@ pub fn check_capabilities() -> (bool, bool) {
 /// )
 /// ```
 ///
-/// # 字段
+/// # Fields
 ///
-/// - `id`: 发送端 ID（可选）
-/// - `ssid`: WiFi SSID（可加密）
-/// - `psk`: WiFi 密码（可加密）
-/// - `mac`: 发送端 MAC 地址（可加密）
-/// - `port`: HTTPS 服务端口
-/// - `key`: 发送端 ECDH 公钥（用于解密上述字段）
-/// - `cat_share`: 协议版本号
+/// - `id`: sender ID (optional)
+/// - `ssid`: WiFi SSID (can be encrypted)
+/// - `psk`: WiFi password (can be encrypted)
+/// - `mac`: sender MAC address (can be encrypted)
+/// - `port`: HTTPS service port
+/// - `key`: sender ECDH public key (used to decrypt the fields above)
+/// - `cat_share`: protocol version number
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct P2pInfo {
@@ -106,7 +107,7 @@ pub struct P2pInfo {
 }
 
 impl P2pInfo {
-    /// 创建未加密的 P2pInfo
+    /// Create an unencrypted P2pInfo
     pub fn new(ssid: String, psk: String, mac: String, port: i32) -> Self {
         Self {
             id: None,
@@ -119,16 +120,16 @@ impl P2pInfo {
         }
     }
 
-    /// 创建带加密字段的 P2pInfo
+    /// Create a P2pInfo with encrypted fields
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `id`: 发送端 ID
-    /// - `ssid_encrypted`: 加密后的 SSID (Base64)
-    /// - `psk_encrypted`: 加密后的密码 (Base64)
-    /// - `mac_encrypted`: 加密后的 MAC 地址 (Base64)
-    /// - `port`: 服务端口
-    /// - `sender_public_key`: 发送端公钥（接收端用此解密）
+    /// - `id`: sender ID
+    /// - `ssid_encrypted`: encrypted SSID (Base64)
+    /// - `psk_encrypted`: encrypted password (Base64)
+    /// - `mac_encrypted`: encrypted MAC address (Base64)
+    /// - `port`: service port
+    /// - `sender_public_key`: sender public key (the receiver uses it to decrypt)
     pub fn with_encryption(
         id: String,
         ssid_encrypted: String,
@@ -148,7 +149,7 @@ impl P2pInfo {
         }
     }
 
-    /// 获取发送端的 HTTPS 地址
+    /// Get the sender's HTTPS address
     pub fn get_server_url(&self, host_ip: &str) -> String {
         format!("https://{}:{}", host_ip, self.port)
     }

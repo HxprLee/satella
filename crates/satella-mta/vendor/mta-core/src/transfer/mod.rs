@@ -1,9 +1,9 @@
-//! 文件传输模块
+//! File transfer module
 //!
-//! 包含:
-//! - WebSocket 协议实现 (CatShare 兼容)
-//! - HTTP/HTTPS 服务器 (发送端)
-//! - HTTP/HTTPS 客户端 (接收端)
+//! Includes:
+//! - WebSocket protocol implementation (CatShare compatible)
+//! - HTTP/HTTPS server (sender)
+//! - HTTP/HTTPS client (receiver)
 
 pub mod http_server;
 pub mod protocol;
@@ -17,7 +17,7 @@ pub use sender_server::{FileEntry, TransferServer, TransferStatus, TransferTask}
 
 use serde::{Deserialize, Serialize};
 
-/// 文件信息（用于传输协商）
+/// File information (used for transfer negotiation)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FileInfo {

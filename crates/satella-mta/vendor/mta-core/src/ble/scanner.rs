@@ -132,9 +132,9 @@ pub trait ScanCallback: Send + Sync {
     async fn on_device_found(&self, device: DiscoveredDevice);
 }
 
-/// 通用的基于 Channel 的扫描回调
+/// Generic channel-based scan callback
 ///
-/// 将发现的设备转换为指定类型的事件并发送到 channel。
+/// Converts discovered devices into events of the specified type and sends them to the channel.
 pub struct ChannelScanCallback<F, T> {
     tx: tokio::sync::mpsc::Sender<T>,
     map_fn: F,
@@ -247,6 +247,12 @@ impl BleScanner {
         }
 
         info!("Scan complete. Found {} devices.", discovered_map.len());
+
+        // Restore the discovery filter to its default so a broad filter is not left behind to affect other scans.
+        if let Err(err) = adapter.set_discovery_filter(Default::default()).await {
+            debug!("Could not restore the discovery filter: {err}");
+        }
+
         Ok(discovered_map.into_values().collect())
     }
 

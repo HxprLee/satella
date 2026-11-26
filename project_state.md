@@ -1,7 +1,7 @@
 # Satella — State of the Project
 
-**Stage:** v0.1.0, greenfield init complete and verified, committed.
-**Last live verification:** 2026-11-24 — unprivileged sudo-less helper path re-verified end to end (no outer `pkexec`, no password prompt, stable user identity); 2026-11-23 — MTA send and receive against a OnePlus 13.
+**Stage:** v0.1.0, greenfield init complete and verified, committed. Daemon mode and its desktop notifications added to `satella-cli` (2026-11-25).
+**Last live verification:** 2026-11-25 — daemon mode: detached start, `status`, `stop`, stale and corrupt pid files, alias; the notification service against a live D-Bus session (a notification was shown and the bus answered); 2026-11-24 — unprivileged sudo-less helper path re-verified end to end (no outer `pkexec`, no password prompt, stable user identity); 2026-11-23 — MTA send and receive against a OnePlus 13.
 
 ---
 
@@ -9,16 +9,122 @@
 
 | Crate | Role | Lines (src) |
 |---|---|---|
-| `satella-core` | Protocol-neutral types + the `ProtocolAdapter` trait. No I/O, no protocol logic. | 399 |
+| `satella-core` | Protocol-neutral types + the `ProtocolAdapter` trait. No I/O, no protocol logic. | 410 |
 | `satella-runtime` | Runs adapters concurrently, merges events, routes sends by protocol. | 182 |
 | `satella-localsend` | LocalSend v2 adapter (vendored engine, 560K). | 922 |
 | `satella-quickshare` | Quick Share adapter (vendored engine, 336K). | 370 |
-| `satella-mta` | MTA adapter (vendored engine, 244K). | 395 |
+| `satella-mta` | MTA adapter (vendored engine, 244K). | 465 |
 | `satella-mta-helper` | Narrow Linux helper: fixed `create`/`destroy` for the P2P GO. | 282 |
 | `satella-api` | The public UniFFI surface (`satella.udl`). | 477 |
-| `satella-cli` | Terminal harness: discover / send / receive. | 344 |
+| `satella-cli` | Terminal harness: discover / send / receive, plus a daemon mode with desktop notifications. | 1935 |
 
 The three vendored crates are excluded from the workspace so upstream's own warnings don't pollute Satella's gates.
+
+---
+
+## Daemon mode
+
+`satella-cli daemon` runs the engine as a detached background process, so the
+device keeps receiving files while nobody is watching the terminal. `status`
+reports what it sees and `stop` shuts it down.
+
+| File | Role |
+|---|---|
+| `crates/satella-cli/src/daemon.rs` | The daemon itself: detach, the event loop, the pid/state files, `status` and `stop`. |
+| `crates/satella-cli/src/peers.rs` | The merged peer table, shared by `discover` and the daemon. |
+| `crates/satella-cli/src/transfer.rs` | The handling of an incoming transfer, shared by `receive` and the daemon. |
+| `crates/satella-cli/src/notify.rs` | The desktop notification service: the D-Bus proxy, the two buttons, and the clicks. |
+| `crates/satella-cli/src/logging.rs` | The log filter, and the file-backed subscriber the daemon uses. |
+| `crates/satella-cli/tests/daemon.rs` | The checks of the peer table and the state file. |
+| `crates/satella-cli/tests/notifications.rs` | The checks of the notification bookkeeping and the flag. |
+| `crates/satella-cli/tests/notification_bus.rs` | The check of the notification service against a bus of its own. |
+
+**It detaches by re-executing itself, not by `fork`.** The CLI is
+`#[tokio::main]`, so the Tokio runtime's worker threads already exist when
+`main()` runs. A forked child would inherit a broken runtime: only the forking
+thread survives and the reactor is gone. The parent therefore sets `setsid` in
+the `pre_exec` hook of a `Command` (which runs between `fork` and `exec`,
+where there is one thread) and execs the binary again with a hidden
+`--daemon-child` flag. The child re-enters `main()`, writes its pid file,
+reports its readiness on a socket, and runs the event loop.
+
+**The readiness handshake is what makes "started" true.** The parent waits for
+the child's `READY <pid>` line before it prints anything. A daemon that dies
+right after it starts is therefore reported as a failure, not as a success.
+
+**The pid file is checked, not trusted.** A pid file that is left over from a
+crashed daemon names a process that is gone. `status` and `stop` call
+`kill(pid, 0)`, which distinguishes a live process from `ESRCH` (gone) and
+`EPERM` (somebody else's). The file also holds the process's start time from
+`/proc/<pid>/stat`, which is what tells a recycled pid from the daemon that
+owns the file: `stop` refuses to signal a pid that was reused.
+
+**The state file is written atomically.** It is written next to its target and
+renamed over it, so `status` never reads half a file. It is only rewritten
+when the peer set or the transfer list actually changed, because discovery
+re-announces peers every few seconds.
+
+### Files the daemon owns
+
+| Path | What it holds |
+|---|---|
+| `~/.cache/satella-cli/satella-cli.pid` | The pid, the start time, the process start ticks, the download directory. |
+| `~/.cache/satella-cli/satella-cli.state.json` | The peers of every protocol and the transfers that were handled. |
+| `~/.cache/satella-cli/satella-cli.log` | The log of the daemon. `RUST_LOG` applies; the default is `info` for the daemon and `warn` for the foreground commands. |
+
+### The desktop notification
+
+The daemon asks the user through a desktop notification before it takes a
+transfer. The notification carries an **Accept** and a **Refuse** button, and
+the click decides what happens to the transfer.
+
+**The notification is the FreeDesktop specification, spoken over the session
+bus.** `crates/satella-cli/src/notify.rs` writes the D-Bus proxy out by hand
+rather than pulling `notify-rust` in: one call and one signal are not worth a
+second D-Bus stack. The `zbus` version is the one the vendored MTA engine
+already uses, so `Cargo.lock` gained no new crate names at all.
+
+**The daemon's loop does not block on the question.** The clicks arrive on
+their own branch of the `tokio::select!`, next to the runtime's event stream
+and the shutdown signal, so a transfer that waits for the user does not stop
+the peers from being discovered or a second transfer from arriving. The
+waiting transfers live in the `Awaiting` map, keyed by the id of the
+notification that asks about them, so a click reaches the transfer it was
+about and two transfers can wait at once.
+
+**Nothing times the question out.** The sender waits for the answer and
+gives up on its own terms; the adapters report that through
+`AdapterEvent::ReceiveExpired`, and the daemon takes the notification down
+with it. There is no client-side timer, so a question the user ignores dies
+with the transfer rather than sitting on the screen forever.
+
+**A machine without a session bus cannot ask.** The daemon takes the
+transfers itself then, and says so in the log. The same happens if the bus
+dies under a running daemon: taking the transfer is better than leaving the
+sender waiting.
+
+**The MTA engine had to change to make this real.** Its receive callback was
+synchronous, so it could only ever answer "yes" instantly — a refusal could
+not exist. The vendored `ReceiverCallback::on_send_request` and
+`ReceiveProgressCallback::on_request` are now `async`, and the question
+travels with a `oneshot::Sender<bool>` that the application answers later.
+The adapter holds the senders by transfer id, so `accept` and `reject` reach
+the right transfer when two of them arrive at once.
+
+### Traps
+
+- **The question has no timer of its own.** The daemon does not time the
+  user out; the sender waits for the answer and gives up on its own terms.
+  A question nobody answers dies with the transfer it was about, through the
+  `AdapterEvent::ReceiveExpired` event the adapters emit.
+- **The daemon is not a service.** It has no `systemd` unit and no control
+  socket: `status` reads a state file, it does not talk to the running
+  process. There is no way to send a file from another process.
+- **The daemon runs unprivileged.** MTA sends go through `satella-mta-helper`
+  as usual, so the daemon needs the helper installed and `pkexec` to work.
+  The `SATELLA_MTA_HELPER` variable has to be in the daemon's environment.
+- **Do not add `fork`.** The same trap as in the MTA helper: `fork` after the
+  Tokio runtime has started is not safe. Re-exec is the way to detach.
 
 ---
 
@@ -32,6 +138,10 @@ cargo doc --workspace --no-deps                         ✅
 
 **Runnable checks left behind:**
 - `satella-runtime/tests/merged_discovery.rs` (3 tests) — merged list covers every protocol with labels; pending receive names the sender's protocol; send reaches the right adapter.
+- `satella-cli/tests/daemon.rs` (7 tests) — the peer table dedupes by protocol and fingerprint; a lost peer leaves the table; an update is a change only when it differs; the state file and the pid file round-trip through JSON; a stale pid is not a running daemon.
+- `satella-cli/tests/notifications.rs` (8 tests) — a click reaches its own transfer; an unknown click decides nothing; two transfers wait at once and each click takes its own; an expired transfer takes its question with it; the daemon asks by default and `--auto-accept` turns the asking off.
+- `satella-cli/tests/notification_bus.rs` (1 test) — against a bus of its own with a fake notification service: the notification really is shown, it really carries the two buttons, and the click really comes back as the right decision.
+- `satella-cli/src/notify.rs` (4 unit tests) — the notification body names the files and the total; a size is shown in a readable unit.
 - `satella-localsend/tests/discovery.rs` (1 test) — two *real* LocalSend adapters finding each other via actual multicast + HTTP register. Not a stub.
 - `satella-localsend/tests/identity.rs` (5 tests) — a certificate survives a restart, a corrupt file is replaced, two instances get distinct identities.
 - `satella-api/tests/identity.rs` (1 test) — `Engine::with_storage_dir` writes the certificate where the platform asked.
@@ -39,6 +149,7 @@ cargo doc --workspace --no-deps                         ✅
 - `crates/satella-mta/vendor/mta-core/tests/p2p_go_probe.rs` — 3 **ignored** root/hardware probes. They are manual validation, not CI; see the runbook below.
 
 **Live evidence on this machine:**
+- Daemon mode (2026-11-25): `satella-cli daemon` started, detached (own session id, no controlling terminal, reparented to `systemd --user`), and survived the shell that started it. `status` reported the pid and the state file was valid JSON; `stop` shut it down and removed the pid file. A second `daemon` refused to start while one was running. A pid file naming a dead process was reported as "not running" and cleaned up by `stop`, and a corrupt pid file was reported as corrupt and replaced on the next start. `--alias` reached the BLE advertisement (`device_name='Test Daemon'`). All three adapters came up in the daemon, exactly as in `discover`.
 - Real file transfer end to end — `hello.txt` sent, received, content verified, receiver reporting `incoming transfer over LocalSend`.
 - Two instances discovering each other, both listed.
 - A real BLE MTA device (`4axI`) discovered alongside LocalSend peers in the same merged list.
@@ -219,9 +330,11 @@ binary can hide a cleanup regression.
 - **Cleanup must wrap every post-GO step**, not just the success path. The
   `transfer = async { … }.await` block plus unconditional `stop_group` in
   `workflow/sender.rs` is deliberate.
-- **MTA receive uses `auto_accept=true`.** The vendor asks synchronously from
-  its transfer task and the sender times out without an instant answer.
-  `MtaAdapter::accept` / `reject` after the event are effectively no-ops.
+- **MTA receive waits for the answer now.** The vendor's receive callback is
+  `async` and its question travels with a `oneshot::Sender<bool>`, so the
+  sender waits for the application's decision instead of for an instant yes.
+  `MtaAdapter::accept` / `reject` answer that question; they are not no-ops.
+  The `auto_accept` flag on the vendor's side is what made that possible.
 - **TLS is mandatory**, and the certificate is intentionally self-signed:
   receivers accept invalid certs and validate content.
 - **`dnsmasq` must be installed.** Without it the phone joins but never gets
@@ -231,6 +344,96 @@ binary can hide a cleanup regression.
   but cosmetically bad; see known gaps.
 - **Rebuild the CLI after vendor edits.** `cargo check` does not update
   `target/debug/satella-cli`; a stale binary silently hides fixes.
+
+---
+
+## BLE pairing (why a phone used to ask to be paired)
+
+**Symptom:** sending or receiving over MTA made the phone pop up a Bluetooth
+pairing request. MTA does not need pairing — SSID/PSK/MAC are protected by an
+application-level ECDH + AES-256-CTR exchange
+(`vendor/mta-core/src/crypto/ble_security.rs`), over a plain, unbonded BLE link.
+
+**Root cause (measured, 2026-11-25): the MTA adapter turned the shared
+adapter unpairable.** The MTA adapter always starts a GATT *server* in the
+background (`satella-mta/src/lib.rs`, the `Receiver` task) — including while
+sending. That server called `adapter.set_pairable(false)`, and because the
+adapter is shared, the *send* path's GATT-client connect ran against a
+non-pairable adapter. The phone (CatShare) starts SMP when it brings up its
+GATT server; the kernel refused the bonding outright, so BlueZ never got
+`ServicesResolved`, and `bluez-async` gave up after its hardcoded 5 s
+(`SERVICE_DISCOVERY_TIMEOUT`) with `Service discovery timed out`.
+
+Evidence from the failing run and from direct probing of the phone:
+
+| Probe | Result |
+|---|---|
+| Phone's MTA characteristics | `00009954` / `00009953`, flags `read`/`write` only — **no** `encrypt`/`authenticate` |
+| Phone's `GattCharacteristic1.MTU` | **517** (payload limit 514) — the ~266-byte encrypted P2P JSON fits in one packet |
+| `bluetoothctl connect` (no MTA running) | connects, stays `Paired: no`, services resolve |
+| `btleplug`/`bluez-async` connect | fails after **5.97 s** with `ServiceDiscoveryTimedOut` — bluez-async's 5 s constant |
+
+The MTU and the "no encrypt flags" facts rule out the long-write /
+`INSUFFICIENT_ENCRYPTION` escalation as the trigger here: the phone never asks
+for encryption on these characteristics, and the payload fits in a single
+packet anyway. The escalation theory still explains the *receive* direction,
+where the phone shows its pairing sheet, but it is not what broke the send.
+
+BlueZ escalates the ATT security level on its own when an ATT request comes
+back with `INSUFFICIENT_ENCRYPTION` (0x0F) or `AUTHENTICATION` (0x05): it raises
+the channel to `BT_ATT_SECURITY_MEDIUM` and retries (BlueZ
+`src/shared/att.c`, `change_security()`). MEDIUM-level links can only be
+obtained through SMP pairing, and the pairing request goes to BlueZ's
+**default** agent (BlueZ `src/agent.c`, `agent_get()`), which on this desktop
+is `blueman`, which shows the PIN dialog. That is why the phone pops a sheet
+even though MTA itself never asks for encryption.
+
+### Send and receive are not symmetric
+
+| Direction | Host role | Who owns the GATT chars | Pairing prompts | Transfer |
+|---|---|---|---|---|
+| Satella **receive** (phone sends) | GATT **server** | Satella — plaintext read/write, no encrypt flags | Host: no. Phone: yes | Succeeds |
+| Satella **send** (phone receives) | GATT **client** | Phone CatShare | Host: no. Phone: yes | Failed |
+
+Both directions let the phone start SMP; the difference is that the host
+is the GATT *server* on receive (so ATT completes even though the phone shows
+a pairing sheet), while on send the host is the GATT *client* and BlueZ blocks
+the connect on the unresolved pairing.
+
+### Rejected pairing is not the same as no pairing
+
+An earlier revision registered an always-rejecting BlueZ **default** agent in
+both `BleClient::new()` and `GattServer`. That silenced the host dialog but did
+not stop SMP. On the send path it was actively harmful: BlueZ-as-client waits
+for `ServicesResolved`, and a rejected pairing means it never arrives, so the
+send failed with `Service discovery timed out` / `Not connected` while the phone
+sat on its pairing sheet. A default agent also *invites* the negotiation —
+BlueZ only asks an agent because an agent is registered.
+
+**Current behaviour (all in `vendor/mta-core/src/ble/`):**
+
+| Change | File | Why |
+|---|---|---|
+| **Never set `Pairable=false` on the adapter** | `server.rs` | The adapter is shared between send and receive. Turning it unpairable makes the kernel refuse the phone's SMP, so `ServicesResolved` never arrives and every send dies with `Service discovery timed out`. "No pairing dialog" is achieved by *not registering an agent*, not by closing the adapter. |
+| No pairing agent on the send path | `client.rs` | A rejected pairing makes BlueZ-as-client stall on `ServicesResolved`. The fix is to avoid triggering SMP, not to refuse it. |
+| No pairing agent on the receive path either | `server.rs`, `security.rs` | Registering an agent makes BlueZ run the SMP exchange; with no agent registered BlueZ rejects the bonding outright and the desktop stays quiet. |
+| Don't retry security errors | `client.rs` | `read_with_retry`/`write_with_retry` used to retry 3×; each retry re-drove the pairing escalation. Security errors now fail immediately as `BleClientError::PairingRequired`. |
+| Read the negotiated ATT MTU and require a single-packet write | `client.rs`, `security.rs` | Kept as a guard, not as the fix: the encrypted P2P JSON is ~266 bytes and the phone reports MTU 517, so it fits. If it ever does not fit, failing fast with `BleClientError::AttMtuTooSmall` is right — long-writing is where phones answer `INSUFFICIENT_ENCRYPTION`, which is what starts SMP. |
+| Map connect-time pairing stalls to `PairingRequired` | `client.rs` | `Service discovery timed out` during `connect()` means SMP was in flight; it now surfaces as `PairingRequired` rather than an opaque IO error, and is not retried. |
+| Restore the discovery filter after a scan | `scanner.rs` | A wide-open filter left behind affects other scanners. |
+
+**Note on the MTU:** `btleplug` does not expose the ATT MTU, so the client opens
+a parallel `bluer` session and reads `org.bluez.GattCharacteristic1.MTU` on the
+P2P characteristic. bluer subtracts 5 for the socket workaround, so the value
+read is slightly conservative — good enough to decide single-packet vs
+long-write.
+
+**Tests:** `cargo test -p satella-mta-vendor --lib` covers the MTU arithmetic
+(`ble::security::tests`) and the security-error classification
+(`ble::client::tests`), which pins the exact D-Bus spellings
+(`"Not paired"`, `"NotPermitted"`, `"AuthenticationFailed"`) — note that
+`dbus::Error`'s `Display` prints only the message, so the error *name* appears
+solely in `Debug`.
 
 ---
 
@@ -254,6 +457,9 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 5. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
 6. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
 7. **One global Tokio runtime** at the UniFFI boundary (noted with a `ponytail:` comment): all adapters share one worker pool, so a busy protocol could starve another. Acceptable until Android background-transfer load proves otherwise; then per-adapter executors.
+8. **The daemon cannot be told anything while it runs.** `status` reads a state file, it does not talk to the process: there is no way to send a file, change the download directory or ask for a rescan from another process. There is no control socket and no `systemd` unit. The daemon also does not restart itself after a crash; `start` refuses while a pid file names a live process, and a dead one is simply overwritten.
+9. **The daemon's log is not rotated.** `~/.cache/satella-cli/satella-cli.log` grows until the user removes it.
+10. **The MTA refusal path has not been exercised against real hardware.** The vendor's callback is async and the answer channel works, but the only MTA receiver seen so far is a phone that sends, not one that is refused. The refusal needs a sender that waits long enough to be told "no".
 
 ---
 
@@ -266,3 +472,4 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 - `crates/satella-mta-helper/` — the fixed-purpose root helper and its JSON protocol.
 - `packaging/` — the polkit action and permanent rule installed by the runbook.
 - `crates/satella-mta/vendor/mta-core/tests/p2p_go_probe.rs` — executable form of the runbook above.
+- `crates/satella-cli/src/daemon.rs` — the daemon: why it re-executes instead of forking, how the readiness handshake works, and how the pid file is checked.
