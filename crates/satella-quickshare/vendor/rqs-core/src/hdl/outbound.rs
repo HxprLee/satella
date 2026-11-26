@@ -54,6 +54,18 @@ type HmacSha256 = Hmac<Sha256>;
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
+/// How long the engine waits for the peer to answer before it gives up.
+///
+/// The peer has to answer the introduction with its consent, and a peer that
+/// never answers would keep the session pending forever. The wait covers the
+/// handshake and the consent only: once the files are on their way, a slow
+/// peer is not a lost one.
+///
+/// ponytail: one flat deadline for the whole handshake. A peer that needs more
+/// than this on a bad network is lost anyway; make it a per-step budget if a
+/// real device ever needs it.
+pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[ts(export)]
 pub enum OutboundPayload {
@@ -68,6 +80,9 @@ pub struct OutboundRequest {
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
     payload: OutboundPayload,
+    /// How long the engine waits for the peer to answer the handshake and
+    /// the consent.
+    pub(crate) consent_timeout: Duration,
 }
 
 impl OutboundRequest {
@@ -102,12 +117,49 @@ impl OutboundRequest {
             sender,
             receiver,
             payload,
+            consent_timeout: CONSENT_TIMEOUT,
         }
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
         // Buffer for the 4-byte length
         let mut length_buf = [0u8; 4];
+
+        // The peer only has to answer the handshake and the consent. Once the
+        // files are on their way a slow peer is not a lost one, so the wait is
+        // only armed while the consent is still outstanding.
+        let waiting_for_consent = matches!(
+            self.state.state,
+            State::SentUkeyClientInit
+                | State::SentUkeyClientFinish
+                | State::SentPairedKeyEncryption
+                | State::SentPairedKeyResult
+                | State::SentIntroduction
+        );
+
+        // The read is bounded, so a peer that goes quiet ends the session
+        // instead of keeping it pending forever. The block only touches the
+        // socket, so it does not hold the whole request.
+        let read = async {
+            let socket = &mut self.socket;
+            if waiting_for_consent {
+                match tokio::time::timeout(
+                    self.consent_timeout,
+                    stream_read_exact(socket, &mut length_buf),
+                )
+                .await
+                {
+                    Ok(result) => result.map(|_| false),
+                    // The peer went quiet. The flag is read outside, so the
+                    // state is changed there.
+                    Err(_) => Ok(true),
+                }
+            } else {
+                stream_read_exact(socket, &mut length_buf)
+                    .await
+                    .map(|_| false)
+            }
+        };
 
         tokio::select! {
             i = self.receiver.recv() => {
@@ -144,8 +196,20 @@ impl OutboundRequest {
                     }
                 }
             },
-            h = stream_read_exact(&mut self.socket, &mut length_buf) => {
-                h?;
+            h = read => {
+                if h? {
+                    // The peer went quiet. The session ends here instead of
+                    // hanging forever.
+                    warn!("the peer did not answer in time ({:?})", self.state.state);
+                    self.update_state(
+                        |e| {
+                            e.state = State::Cancelled;
+                        },
+                        true,
+                    )
+                    .await;
+                    return Err(anyhow!(crate::errors::AppError::TimedOut));
+                }
 
                 self._handle(length_buf).await?
             }
@@ -528,6 +592,30 @@ impl OutboundRequest {
             location_nearby_connections::v1_frame::FrameType::KeepAlive => {
                 trace!("Sending keepalive");
                 self.send_keepalive(true).await?;
+            }
+            location_nearby_connections::v1_frame::FrameType::Disconnection => {
+                // The peer is closing the session. It sends this frame once it
+                // got everything it wanted, or once it gave up. Answering it
+                // with a disconnection of our own would be polite, but the
+                // peer is already tearing the socket down, so the frame is
+                // only a notice that the session is over.
+                //
+                // A transfer that already completed stays completed: the peer
+                // hanging up after the last byte does not undo it.
+                if self.state.state != State::Finished {
+                    info!("The peer disconnected before the transfer was over");
+                    self.update_state(
+                        |e: &mut InnerState| {
+                            e.state = State::Disconnected;
+                        },
+                        true,
+                    )
+                    .await;
+                } else {
+                    info!("The peer disconnected");
+                }
+
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
             }
             _ => {
                 error!("Unhandled offline frame encrypted: {:?}", offline);
@@ -915,9 +1003,12 @@ impl OutboundRequest {
                     "Cannot process: consent denied: {:?}",
                     v1_frame.connection_response.as_ref().unwrap().status()
                 );
+                // The peer refused the transfer. That is not the same as the
+                // peer hanging up, and the caller has to be able to tell the
+                // two apart.
                 self.update_state(
                     |e| {
-                        e.state = State::Disconnected;
+                        e.state = State::Rejected;
                     },
                     true,
                 )

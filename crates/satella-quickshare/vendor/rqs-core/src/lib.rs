@@ -3,6 +3,7 @@ extern crate log;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use channel::ChannelMessage;
@@ -26,10 +27,13 @@ pub mod channel;
 mod errors;
 mod hdl;
 mod manager;
+pub mod outcome;
 mod utils;
 
+pub use hdl::CONSENT_TIMEOUT;
 pub use hdl::{EndpointInfo, OutboundPayload, State, Visibility};
 pub use manager::SendInfo;
+pub use outcome::{OutcomeRegistry, SendOutcome};
 pub use utils::DeviceType;
 
 pub mod sharing_nearby {
@@ -68,6 +72,16 @@ pub struct RQS {
     port_number: Option<u32>,
 
     pub message_sender: broadcast::Sender<ChannelMessage>,
+
+    /// The receipts of the outgoing transfers.
+    ///
+    /// A caller that starts a transfer waits on the receipt of its id, so it
+    /// learns whether the peer agreed, refused, or never answered.
+    pub outcomes: Arc<OutcomeRegistry>,
+
+    /// How long the engine waits for a peer to answer the handshake and the
+    /// consent before it gives up.
+    pub consent_timeout: Duration,
 }
 
 impl Default for RQS {
@@ -101,6 +115,8 @@ impl RQS {
             ble_sender,
             port_number,
             message_sender,
+            outcomes: OutcomeRegistry::new(),
+            consent_timeout: CONSENT_TIMEOUT,
         }
     }
 
@@ -130,6 +146,8 @@ impl RQS {
             tcp_listener,
             self.message_sender.clone(),
             send_channel.1,
+            self.outcomes.clone(),
+            self.consent_timeout,
         )?;
         let ctk = ctoken.clone();
         tracker.spawn(async move { server.run(ctk).await });

@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use bytes::Bytes;
-use get_if_addrs::get_if_addrs;
+use get_if_addrs::{get_if_addrs, IfAddr};
 use hkdf::Hkdf;
 use num_bigint::{BigUint, ToBigInt};
 use p256::elliptic_curve::rand_core::OsRng;
@@ -218,9 +218,142 @@ pub fn is_not_self_ip(ip_address: &Ipv4Addr) -> bool {
     true
 }
 
+/// Parses an IPv4 address as `/proc/net/route` prints it: a 32-bit number in
+/// hex, in the host's byte order.
+fn parse_route_address(value: &str) -> Option<Ipv4Addr> {
+    let raw = u32::from_str_radix(value.trim(), 16).ok()?;
+    Some(Ipv4Addr::from(raw.to_le_bytes()))
+}
+
+/// The default route: the interface that carries it and the gateway it points
+/// at.
+///
+/// The route table is read from `/proc/net/route`. The columns are the
+/// interface name, the destination, the gateway, the flags, the reference
+/// count, the use count, the metric, the mask, the MTU, the window and the
+/// RTT. A default route is the row whose destination is all zeroes.
+fn default_route() -> Option<(String, Ipv4Addr)> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_route(&table)
+}
+
+/// The default route of a route table in the `/proc/net/route` format.
+///
+/// A default route with an unspecified gateway is a "default device" route:
+/// it says which interface the traffic leaves by, but there is no gateway to
+/// pick a subnet from. Such a route is only used when no route with a real
+/// gateway exists, because the gateway is what identifies the subnet the
+/// peers are on.
+fn parse_default_route(table: &str) -> Option<(String, Ipv4Addr)> {
+    let mut best: Option<(bool, u64, String, Ipv4Addr)> = None;
+
+    for line in table.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 || fields[1] != "00000000" {
+            continue;
+        }
+
+        let Some(gateway) = parse_route_address(fields[2]) else {
+            continue;
+        };
+
+        let metric = fields[6].parse::<u64>().unwrap_or(u64::MAX);
+        // A route with a gateway outranks one without, whatever the metric
+        // says: the gateway is what names the subnet the peers are on.
+        let has_gateway = !gateway.is_unspecified();
+
+        let is_better = match &best {
+            None => true,
+            Some((best_has_gateway, best_metric, _, _)) => {
+                has_gateway && !*best_has_gateway
+                    || (has_gateway == *best_has_gateway && metric < *best_metric)
+            }
+        };
+
+        if is_better {
+            best = Some((has_gateway, metric, fields[0].to_owned(), gateway));
+        }
+    }
+
+    best.map(|(_, _, name, gateway)| (name, gateway))
+}
+
+/// Whether two addresses are in the same subnet.
+fn same_subnet(ip: Ipv4Addr, netmask: Ipv4Addr, other: Ipv4Addr) -> bool {
+    let mask = u32::from(netmask);
+    (u32::from(ip) & mask) == (u32::from(other) & mask)
+}
+
+/// The IPv4 address a peer on the local network can reach.
+///
+/// The mDNS advertisement must name exactly one address. The daemon opens a
+/// socket per host address and answers the queries on every one of them, so
+/// an address a peer cannot route to becomes a second, competing answer for
+/// the same service.
+///
+/// The address of the default route's subnet is the one a peer on that network
+/// can reach. A Wi-Fi Direct group owner (MTA's `192.168.49.1`), a VPN
+/// address and a Docker bridge address all live on this host too; picking by
+/// subnet excludes them without a blacklist.
+pub fn reachable_ipv4() -> Option<Ipv4Addr> {
+    let interfaces = get_if_addrs().ok()?;
+    select_reachable_ipv4(&interfaces, default_route().as_ref())
+}
+
+/// The address to advertise, out of the host's interfaces and its default
+/// route.
+fn select_reachable_ipv4(
+    interfaces: &[get_if_addrs::Interface],
+    route: Option<&(String, Ipv4Addr)>,
+) -> Option<Ipv4Addr> {
+    if let Some((iface_name, gateway)) = route {
+        // The address of the interface's own subnet that holds the gateway.
+        for interface in interfaces {
+            if interface.name != *iface_name {
+                continue;
+            }
+            let IfAddr::V4(v4) = &interface.addr else {
+                continue;
+            };
+            if !gateway.is_unspecified() && same_subnet(v4.ip, v4.netmask, *gateway) {
+                return Some(v4.ip);
+            }
+        }
+
+        // The gateway is on link (a point-to-point route) or it is in a subnet
+        // that this host has no address for: the interface's first address is
+        // the best guess left.
+        for interface in interfaces {
+            if interface.name != *iface_name {
+                continue;
+            }
+            let IfAddr::V4(v4) = &interface.addr else {
+                continue;
+            };
+            if !v4.ip.is_loopback() {
+                return Some(v4.ip);
+            }
+        }
+    }
+
+    // No default route, or an unreadable route table: the host's first
+    // non-loopback address.
+    for interface in interfaces {
+        let IfAddr::V4(v4) = &interface.addr else {
+            continue;
+        };
+        if !v4.ip.is_loopback() {
+            return Some(v4.ip);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use get_if_addrs::{IfAddr, Ifv4Addr, Interface};
 
     #[test]
     fn test_gen_and_parse_mdns_info() {
@@ -235,5 +368,124 @@ mod tests {
 
         assert_eq!(parse_info.1, device_name);
         assert_eq!(parse_info.0, device_type);
+    }
+
+    /// An interface with one IPv4 address.
+    fn interface(name: &str, ip: Ipv4Addr, netmask: Ipv4Addr) -> Interface {
+        Interface {
+            name: name.to_owned(),
+            addr: IfAddr::V4(Ifv4Addr {
+                ip,
+                netmask,
+                broadcast: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_default_route_is_the_row_with_the_zero_destination() {
+        let table = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
+wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0
+docker0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0
+";
+
+        let (name, gateway) = parse_default_route(table).unwrap();
+
+        assert_eq!(name, "wlan0");
+        // 0101A8C0 little-endian is C0A80101, which is 192.168.1.1.
+        assert_eq!(gateway, Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    #[test]
+    fn the_address_of_the_gateways_subnet_is_the_one_to_advertise() {
+        // The host carries the address of the default route's subnet and the
+        // address of a Wi-Fi Direct group owner on the same interface. Only the
+        // first one is reachable from the network.
+        let interfaces = vec![
+            interface(
+                "wlan0",
+                Ipv4Addr::new(192, 168, 49, 1),
+                Ipv4Addr::new(255, 255, 255, 0),
+            ),
+            interface(
+                "wlan0",
+                Ipv4Addr::new(192, 168, 1, 5),
+                Ipv4Addr::new(255, 255, 255, 0),
+            ),
+        ];
+        let route = ("wlan0".to_owned(), Ipv4Addr::new(192, 168, 1, 1));
+
+        let address = select_reachable_ipv4(&interfaces, Some(&route)).unwrap();
+
+        assert_eq!(address, Ipv4Addr::new(192, 168, 1, 5));
+    }
+
+    #[test]
+    fn an_address_on_another_subnet_is_never_the_one_to_advertise() {
+        let interfaces = vec![interface(
+            "wlan0",
+            Ipv4Addr::new(10, 2, 0, 111),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let route = ("wlan0".to_owned(), Ipv4Addr::new(192, 168, 1, 1));
+
+        // No address of this interface is in the gateway's subnet, so the
+        // interface's own address is the best guess left.
+        let address = select_reachable_ipv4(&interfaces, Some(&route)).unwrap();
+
+        assert_eq!(address, Ipv4Addr::new(10, 2, 0, 111));
+    }
+
+    #[test]
+    fn without_a_default_route_the_first_non_loopback_address_is_used() {
+        let interfaces = vec![
+            interface(
+                "lo",
+                Ipv4Addr::new(127, 0, 0, 1),
+                Ipv4Addr::new(255, 0, 0, 0),
+            ),
+            interface(
+                "eth0",
+                Ipv4Addr::new(172, 17, 0, 2),
+                Ipv4Addr::new(255, 255, 0, 0),
+            ),
+        ];
+
+        let address = select_reachable_ipv4(&interfaces, None).unwrap();
+
+        assert_eq!(address, Ipv4Addr::new(172, 17, 0, 2));
+    }
+
+    #[test]
+    fn the_address_to_advertise_is_the_one_of_the_gateways_subnet() {
+        // The check runs against this host's real route table: the address it
+        // picks has to be in the gateway's subnet.
+        let Some((iface_name, gateway)) = default_route() else {
+            // A host without a default route has nothing to check.
+            return;
+        };
+
+        let Some(address) = reachable_ipv4() else {
+            return;
+        };
+
+        let interfaces = get_if_addrs().unwrap();
+        let interface = interfaces
+            .iter()
+            .find(|i| i.name == iface_name)
+            .expect("the default route's interface exists");
+
+        let IfAddr::V4(v4) = &interface.addr else {
+            return;
+        };
+
+        if !gateway.is_unspecified() {
+            assert!(
+                same_subnet(address, v4.netmask, gateway),
+                "{address} is not in the subnet of the gateway {gateway}"
+            );
+        }
     }
 }

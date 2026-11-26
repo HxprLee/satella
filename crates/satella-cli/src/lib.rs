@@ -301,10 +301,22 @@ async fn send(fingerprint: &str, files: &[PathBuf]) -> Result<()> {
         eprintln!("warning: {failure}");
     }
 
+    send_with(&mut runtime, fingerprint, files).await
+}
+
+/// Sends files to a peer over an already running runtime.
+///
+/// The peer is looked up in the merged event stream, so the fingerprint is
+/// looked up as the peer announces itself. A peer that is not found within
+/// the timeout is reported, not silently skipped.
+///
+/// The runtime is stopped once the send is over, whether it worked or not:
+/// a session that is left half open keeps the engine busy.
+pub async fn send_with(runtime: &mut Runtime, fingerprint: &str, files: &[PathBuf]) -> Result<()> {
     // The peer is looked up in the merged event stream, so the fingerprint is
     // looked up as the peer announces itself. A peer that is not found within
     // the timeout is reported, not silently skipped.
-    let peer = wait_for_peer(&mut runtime, fingerprint, PEER_TIMEOUT).await?;
+    let peer = wait_for_peer(runtime, fingerprint, PEER_TIMEOUT).await?;
 
     println!(
         "sending to {} over {}",
@@ -320,10 +332,15 @@ async fn send(fingerprint: &str, files: &[PathBuf]) -> Result<()> {
             .collect(),
     };
 
-    runtime.send(request).await.context("the send failed")?;
+    // The send is only over when the peer says so. A refused transfer and a
+    // peer that never answers are both failures, and the engine is stopped
+    // either way, so the session is not left half open.
+    let outcome = runtime.send(request).await;
+    runtime.stop().await;
+
+    outcome.context("the send failed")?;
     println!("sent {} file(s)", files.len());
 
-    runtime.stop().await;
     Ok(())
 }
 

@@ -38,7 +38,7 @@ peer's protocol. The frontend just says "send this file to that peer".
 | Protocols   | Discovery | Advertisement | Send              | Receive |
 | ----------- | --------- | ------------- | ----------------- | ------- |
 | LocalSend   | Works     | Works         | Works             | Works   |
-| Quick Share | Works     | Works         | In-work           | Works   |
+| Quick Share | Works     | Works         | Works             | Works   |
 | MTA         | Works     | Works         | Partially (1) (2) | Works   |
 
 1. Sending files via MTA requires root via `pkexec`

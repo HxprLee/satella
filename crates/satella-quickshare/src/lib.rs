@@ -30,6 +30,11 @@ pub struct Config {
     pub port: Option<u16>,
     /// The directory received files are written into.
     pub download_path: Option<PathBuf>,
+    /// How long the engine waits for a peer to answer the handshake and the
+    /// consent before it gives up.
+    ///
+    /// `None` uses the engine's own default.
+    pub consent_timeout: Option<std::time::Duration>,
 }
 
 /// The Quick Share adapter.
@@ -42,6 +47,11 @@ struct InnerState {
     engine: RQS,
     /// The channel the engine sends its send requests on.
     send_tx: mpsc::Sender<satella_quickshare_vendor::SendInfo>,
+    /// The receipts of the outgoing transfers.
+    ///
+    /// The engine answers a send over this registry, so the caller learns
+    /// whether the peer agreed, refused, or never answered.
+    outcomes: Arc<satella_quickshare_vendor::OutcomeRegistry>,
     /// The peers seen on the network, by endpoint ID.
     peers: Arc<std::sync::Mutex<HashMap<String, Peer>>>,
 }
@@ -96,6 +106,10 @@ impl ProtocolAdapter for QuickShareAdapter {
             self.config.port.map(u32::from),
             self.config.download_path.clone(),
         );
+
+        if let Some(timeout) = self.config.consent_timeout {
+            engine.consent_timeout = timeout;
+        }
 
         let (send_tx, _send_rx) = engine.run().await.map_err(|err| AdapterError::Startup {
             protocol: Protocol::QuickShare,
@@ -215,11 +229,55 @@ impl ProtocolAdapter for QuickShareAdapter {
                             ))
                             .await;
                     }
+
+                    // An outgoing transfer reports how it ends, so a frontend
+                    // sees a refused transfer as refused and not as one that
+                    // is still going.
+                    if message.rtype == Some(TransferType::Outbound) {
+                        let progress = match state {
+                            satella_quickshare_vendor::State::Finished => {
+                                satella_core::peer::TransferProgress::Finished
+                            }
+                            satella_quickshare_vendor::State::Rejected => {
+                                satella_core::peer::TransferProgress::Failed {
+                                    reason: "the peer rejected the transfer".to_owned(),
+                                }
+                            }
+                            satella_quickshare_vendor::State::Cancelled => {
+                                satella_core::peer::TransferProgress::Failed {
+                                    reason: "the transfer was cancelled".to_owned(),
+                                }
+                            }
+                            satella_quickshare_vendor::State::Disconnected => {
+                                satella_core::peer::TransferProgress::Failed {
+                                    reason: "the peer hung up before the transfer was over"
+                                        .to_owned(),
+                                }
+                            }
+                            satella_quickshare_vendor::State::SendingFiles => {
+                                let total = message
+                                    .meta
+                                    .as_ref()
+                                    .map(|m| m.total_bytes)
+                                    .unwrap_or_default();
+                                let transferred = message
+                                    .meta
+                                    .as_ref()
+                                    .map(|m| m.ack_bytes)
+                                    .unwrap_or_default();
+                                satella_core::peer::TransferProgress::Bytes { transferred, total }
+                            }
+                            _ => continue,
+                        };
+
+                        let _ = events.send(AdapterEvent::Progress(progress)).await;
+                    }
                 }
             });
         }
 
         *self.state.lock().await = Some(InnerState {
+            outcomes: engine.outcomes.clone(),
             engine,
             send_tx,
             peers,
@@ -246,13 +304,18 @@ impl ProtocolAdapter for QuickShareAdapter {
     }
 
     async fn send(&self, request: SendRequest) -> AdapterResult<()> {
-        let state = self.state.lock().await;
-        let Some(state) = state.as_ref() else {
-            return Err(AdapterError::Startup {
-                protocol: Protocol::QuickShare,
-                reason: "the adapter is not running".to_owned(),
-            });
+        let (send_tx, outcomes) = {
+            let state = self.state.lock().await;
+            let Some(state) = state.as_ref() else {
+                return Err(AdapterError::Startup {
+                    protocol: Protocol::QuickShare,
+                    reason: "the adapter is not running".to_owned(),
+                });
+            };
+            (state.send_tx.clone(), state.outcomes.clone())
         };
+        // The lock is released before the transfer is waited for: holding it
+        // for the whole session would stop the adapter from being stopped.
 
         let peer = &request.peer;
         let Some(address) = peer.address else {
@@ -274,10 +337,15 @@ impl ProtocolAdapter for QuickShareAdapter {
             files.push(path.to_string_lossy().to_string());
         }
 
-        state
-            .send_tx
+        // The receipt of the transfer is keyed by the id of the transfer. It
+        // has to be unique, because two transfers to the same peer would
+        // otherwise share one receipt.
+        let transfer_id = format!("{}:{}", peer.fingerprint, uuid::Uuid::new_v4());
+        let receipt = outcomes.register(&transfer_id);
+
+        send_tx
             .send(satella_quickshare_vendor::SendInfo {
-                id: peer.fingerprint.clone(),
+                id: transfer_id,
                 name: peer.alias.clone(),
                 addr: address.to_string(),
                 ob: OutboundPayload::Files(files),
@@ -288,7 +356,29 @@ impl ProtocolAdapter for QuickShareAdapter {
                 reason: err.to_string(),
             })?;
 
-        Ok(())
+        // The transfer is only over when the peer says so. Answering before
+        // the peer agreed is what made a refused transfer look like a
+        // successful one.
+        let outcome = receipt.await.map_err(|_| AdapterError::Transfer {
+            protocol: Protocol::QuickShare,
+            reason: "the engine stopped before the transfer was over".to_owned(),
+        })?;
+
+        match outcome {
+            satella_quickshare_vendor::SendOutcome::Completed => Ok(()),
+            satella_quickshare_vendor::SendOutcome::Rejected => Err(AdapterError::Transfer {
+                protocol: Protocol::QuickShare,
+                reason: "the peer rejected the transfer".to_owned(),
+            }),
+            satella_quickshare_vendor::SendOutcome::TimedOut => Err(AdapterError::Unreachable {
+                protocol: Protocol::QuickShare,
+                reason: "the peer did not answer".to_owned(),
+            }),
+            satella_quickshare_vendor::SendOutcome::Failed(reason) => Err(AdapterError::Transfer {
+                protocol: Protocol::QuickShare,
+                reason,
+            }),
+        }
     }
 
     async fn accept(&self, pending: ReceivePending, _destination: PathBuf) -> AdapterResult<()> {

@@ -3740,6 +3740,7 @@ name = "satella-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs",
  "futures-util",
  "libc",
@@ -3923,6 +3924,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

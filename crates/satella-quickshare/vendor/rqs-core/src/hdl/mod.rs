@@ -25,6 +25,11 @@ mod mdns;
 pub use mdns::*;
 mod outbound;
 pub use outbound::*;
+#[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
+mod outcome_tests;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq)]

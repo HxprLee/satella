@@ -11,12 +11,12 @@
 |---|---|---|
 | `satella-core` | Protocol-neutral types + the `ProtocolAdapter` trait. No I/O, no protocol logic. | 410 |
 | `satella-runtime` | Runs adapters concurrently, merges events, routes sends by protocol. | 182 |
-| `satella-localsend` | LocalSend v2 adapter (vendored engine, 560K). | 922 |
-| `satella-quickshare` | Quick Share adapter (vendored engine, 336K). | 370 |
-| `satella-mta` | MTA adapter (vendored engine, 244K). | 465 |
+| `satella-localsend` | LocalSend v2 adapter (vendored engine, 560K). | 932 |
+| `satella-quickshare` | Quick Share adapter (vendored engine, 336K). | 478 |
+| `satella-mta` | MTA adapter (vendored engine, 244K). | 467 |
 | `satella-mta-helper` | Narrow Linux helper: fixed `create`/`destroy` for the P2P GO. | 282 |
-| `satella-api` | The public UniFFI surface (`satella.udl`). | 477 |
-| `satella-cli` | Terminal harness: discover / send / receive, plus a daemon mode with desktop notifications. | 1935 |
+| `satella-api` | The public UniFFI surface (`satella.udl`). | 483 |
+| `satella-cli` | Terminal harness: discover / send / receive, plus a daemon mode with desktop notifications. | 1972 |
 
 The three vendored crates are excluded from the workspace so upstream's own warnings don't pollute Satella's gates.
 
@@ -146,6 +146,9 @@ cargo doc --workspace --no-deps                         ✅
 - `satella-localsend/tests/identity.rs` (5 tests) — a certificate survives a restart, a corrupt file is replaced, two instances get distinct identities.
 - `satella-api/tests/identity.rs` (1 test) — `Engine::with_storage_dir` writes the certificate where the platform asked.
 - Vendored upstream suites also run: **99 + 35 + 13 + 5** tests, all green.
+- `crates/satella-quickshare/vendor/rqs-core/src/hdl/session_tests.rs` (4 tests) — a disconnection frame ends both handlers without an error; a finished transfer is not downgraded to a disconnection; the session states that mean "the session is over" are the ones the manager does not report as failures.
+- `crates/satella-quickshare/vendor/rqs-core/src/utils.rs` (5 tests) — the default route is the row with the zero destination, the address to advertise is the one in the gateway's subnet, an address on another subnet of the same interface is never chosen, and the choice holds against the host's real route table.
+- `crates/satella-quickshare/vendor/rqs-core/src/hdl/mdns.rs` (1 test) — the advertisement names exactly one address and does not have `addr_auto` on.
 - `crates/satella-mta/vendor/mta-core/tests/p2p_go_probe.rs` — 3 **ignored** root/hardware probes. They are manual validation, not CI; see the runbook below.
 
 **Live evidence on this machine:**
@@ -437,6 +440,159 @@ solely in `Debug`.
 
 ---
 
+## Quick Share session teardown
+
+**Symptom:** sending a file to a Quick Share peer ended with two errors on an
+otherwise successful transfer:
+
+```
+ERROR satella_quickshare_vendor::hdl::outbound: Unhandled offline frame encrypted:
+  OfflineFrame { version: Some(V1), v1: Some(V1Frame { r#type: Some(Disconnection), ...
+ERROR satella_quickshare_vendor::manager: TcpServer: error while handling client:
+  early eof (Finished)
+```
+
+**Root cause:** a peer closes the session with a `DISCONNECTION` frame and
+then hangs up. The encrypted frame handling only knew `PAYLOAD_TRANSFER` and
+`KEEP_ALIVE`, so the disconnection fell through to a catch-all that logged it
+as an unhandled frame and carried on. The socket then ended, and the manager
+reported that end as a failure — even though the session was already over.
+
+**Two defects, one symptom:**
+
+| File | Change | Why |
+|---|---|---|
+| `vendor/rqs-core/src/hdl/outbound.rs` | The encrypted frame handling answers `FrameType::Disconnection`: it sets the state to `Disconnected` and returns `AppError::NotAnError`. | The frame is the peer saying the session is over. It is not an error, and the engine has to stop reading the socket. |
+| `vendor/rqs-core/src/hdl/inbound.rs` | The same answer on the receiving side. | The same frame arrives there, and the transfer that was waiting for a decision dies with the session. |
+| `vendor/rqs-core/src/manager.rs` | A socket that ends after the session was over is logged at debug level, through the new `is_terminal` helper. | The end of the socket is the normal end of a transfer. Reporting it as an error buried the failures that matter. |
+
+**A finished transfer stays finished.** The peer sends the disconnection right
+after the last byte, so the frame arrives after the transfer is over. The
+handler checks the state first and does not downgrade a `Finished` transfer to
+a `Disconnected` one.
+
+**Checks:** `crates/satella-quickshare/vendor/rqs-core/src/hdl/session_tests.rs`
+(4 tests) drives the real handlers over a real socket pair, with the real
+encryption, so the frame the peer sends is the frame the engine has to
+understand. The checks were falsified: reverting the outbound fix fails the
+two outbound checks, reverting the inbound fix fails the inbound one.
+
+---
+
+## Quick Share advertisement (one address, or the peer gives up)
+
+**Symptom:** a phone could *discover* Satella over Quick Share but could not
+send a file to it. The device was listed, the send never started, no consent
+prompt appeared, no file arrived.
+
+**Root cause:** the mDNS advertisement named **two** IPv4 addresses for one
+service. `vendor/rqs-core/src/hdl/mdns.rs` asked for automatic addressing
+(`enable_addr_auto(AddrType::V4)`), and the mDNS fork sweeps in *every*
+non-loopback address of the host. An interrupted MTA send had left its
+Wi-Fi Direct group owner address `192.168.49.1/24` on `wlan0`, so the service
+was answered twice — once from `192.168.1.5` and once from `192.168.49.1` —
+with the same SRV target and a different A record each time. The peer had two
+candidates for one service, one of them unroutable from the phone's subnet,
+and the transfer never began.
+
+**The trap:** the mDNS daemon opens one socket per host address and answers on
+every one of them. An address a peer cannot route to is not ignored — it is a
+second, competing answer for the same service. Any secondary address on the
+machine (a Wi-Fi Direct group owner, a VPN, a Docker bridge) does this.
+
+**The fix:** the advertisement names exactly one address — the one of the
+default route's subnet. `vendor/rqs-core/src/utils.rs` reads the default route
+from `/proc/net/route` and picks the address of that interface that is in the
+gateway's subnet; `mdns.rs` passes that address to `ServiceInfo::new` and
+leaves `enable_addr_auto` off. The flag has to stay off: the fork re-adds a
+newly appearing address to an `addr_auto` service within 30 seconds, so
+dropping it is what makes the single address stick. The service is rebuilt and
+re-registered when the address to advertise changes, so a host that comes up
+without a network or moves to another one still advertises the right address.
+
+**Checks:** `vendor/rqs-core/src/utils.rs` (5 tests) and
+`vendor/rqs-core/src/hdl/mdns.rs` (1 test) — the selected address is in the
+gateway's subnet, an address on another subnet of the same interface is never
+chosen, and the built `ServiceInfo` holds exactly one address with
+`addr_auto` off.
+
+**Verified on the wire:** with `192.168.49.1/24` still on `wlan0`, the
+service is answered from `192.168.1.5` only, with a single `A 192.168.1.5`
+record. Before the fix the same host answered from both addresses.
+
+**Also fixed:** the accept of an inbound connection was logged at `trace`,
+below the daemon's `info` filter, so a connection that was accepted and then
+dropped left no record at all. It is now `info`.
+
+---
+
+## Quick Share send reported a refused transfer as a success
+
+**Symptom:** sending a file to a Quick Share peer always printed
+
+```
+sending to 一加 13 over Quick Share
+sent 1 file(s)
+```
+
+even when the peer refused the transfer or never answered the request. The
+two lines appeared within the same second, so no session had happened at all.
+
+**Root cause:** the send answered before the peer had said anything.
+
+| Layer | What it did | What was missing |
+|---|---|---|
+| `satella-cli` | `runtime.send(request).await` returned `Ok(())`, and the command printed `sent N file(s)`. | No wait for the peer's consent, and no failure path at all. |
+| `satella-quickshare` | `QuickShareAdapter::send()` pushed a `SendInfo` into the engine's channel and returned `Ok(())`. | The channel only carries the *request*. The outcome of the transfer had no way back to the caller. |
+| `vendor/rqs-core` | The real session ran in `TcpServer::connect()`. It knew the outcome — the vendor even logs `Cannot process: consent denied` — but wrote it into a broadcast nobody was reading for outbound transfers. | No channel from the session back to the caller that started it. |
+
+Quick Share was the only adapter with this shape: MTA waits on the vendor's
+`SendEvent::Complete`/`SendEvent::Error` and LocalSend waits on the HTTP
+`prepare-upload` response, which is a `403 Rejected` when the peer says no.
+
+**Two defects behind the one symptom:**
+
+1. **The outcome had no way back.** The engine now answers every send over a
+   registry of one-shot receipts, keyed by the id of the transfer
+   (`vendor/rqs-core/src/outcome.rs`). The receipt says what happened:
+   `Completed`, `Rejected`, `TimedOut`, or `Failed(reason)`. The registry is
+   used instead of a field inside `SendInfo` because `SendInfo` is
+   serializable and its TypeScript binding is generated from it, and a
+   one-shot sender is neither.
+2. **A peer that never answers hung forever.** The engine read the socket
+   without a deadline, so a peer that ignored the request kept the session
+   pending forever and no receipt was ever produced. The wait is now bounded
+   (30s by default, `Config::consent_timeout` overrides it). It covers the
+   handshake and the consent only: once the files are on their way a slow
+   peer is not a lost one.
+
+**A refusal is not a hang-up.** The refusal path recorded
+`State::Disconnected`, which is what a peer that hung up records, so even a
+caller that listened could not tell "the peer said no" from "the peer
+vanished". The refusal now records `State::Rejected`.
+
+**The adapter waits, and it does not hold the lock.** `send()` takes the
+`send_tx` and the registry, releases the lock, and only then waits for the
+receipt — holding it for the whole session would stop the adapter from being
+stopped. The transfer id carries a UUID, because two transfers to the same
+peer would otherwise share one receipt.
+
+**Checks:**
+- `vendor/rqs-core/src/hdl/outcome_tests.rs` (4 tests): a refusal is a
+  rejection and not a disconnection, a peer that never answers ends the
+  session, the receipt names the outcome, a transfer nobody waits for is not
+  an error.
+- `crates/satella-quickshare/tests/outcome.rs` (2 tests): a send to a peer
+  that never answers fails, a send to a peer that hangs up fails.
+- `crates/satella-cli/tests/send_report.rs` (1 test): a refused transfer is
+  not reported as a sent file.
+
+The checks were falsified: reverting the `State::Rejected` change fails the
+refusal check, and making the adapter answer before the receipt fails both
+adapter checks.
+
+---
+
 ## Bugs found and fixed during init
 
 All in the adapter seam, all found because the checks exercised real protocol paths:
@@ -450,16 +606,18 @@ All in the adapter seam, all found because the checks exercised real protocol pa
 
 ## Known gaps
 
-1. **Quick Share transfer leg is unverified.** Its `send`/`accept`/`reject` are fully implemented (no `todo!()`/`unimplemented!()` anywhere), and discovery is confirmed — but a real file transfer has not been exercised. This is the obvious next target.
-2. **MTA sending needs a one-time Linux helper install.** Android receivers only join a real Wi-Fi Direct group owner, and wpa_supplicant's D-Bus API is root-only. The privileged operations now live in `satella-mta-helper` plus a packaged polkit action, so the CLI stays unprivileged and keeps `~/.config/satella/mta-identity`. Without that install, MTA send still needs the whole CLI under `sudo`/`pkexec`, or it falls back to the Satella-only NetworkManager hotspot. Distro packaging for the helper/policy files is still manual.
-3. **mDNS/LocalSend error spam while `wlan0` is a GO.** Sockets still point at the previous address and log “Network is unreachable”. Cosmetic; suppress or rebind while the GO is up.
-4. **NetworkManager keeps a stale `p2p-dev-wlan0` device.** The kernel interface is gone after the group is destroyed, but NM still lists the P2P device object. It does not block the Wi-Fi restore, which is re-activated explicitly. Cosmetic.
-5. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
-6. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
-7. **One global Tokio runtime** at the UniFFI boundary (noted with a `ponytail:` comment): all adapters share one worker pool, so a busy protocol could starve another. Acceptable until Android background-transfer load proves otherwise; then per-adapter executors.
-8. **The daemon cannot be told anything while it runs.** `status` reads a state file, it does not talk to the process: there is no way to send a file, change the download directory or ask for a rescan from another process. There is no control socket and no `systemd` unit. The daemon also does not restart itself after a crash; `start` refuses while a pid file names a live process, and a dead one is simply overwritten.
-9. **The daemon's log is not rotated.** `~/.cache/satella-cli/satella-cli.log` grows until the user removes it.
-10. **The MTA refusal path has not been exercised against real hardware.** The vendor's callback is async and the answer channel works, but the only MTA receiver seen so far is a phone that sends, not one that is refused. The refusal needs a sender that waits long enough to be told "no".
+1. **Quick Share transfer leg is only half verified.** Its `send`/`accept`/`reject` are fully implemented (no `todo!()`/`unimplemented!()` anywhere), and discovery is confirmed. A real file transfer **receive** from a OnePlus 13 was exercised end to end (2026-11-26: consent, transfer, file written). The **send** direction reaches the peer and the peer answers, but the session teardown was reported as a failure (see "Quick Share session teardown" below); that is now fixed and the checks cover it, but a real send against a phone has not been re-run since. That is the obvious next target. The send also used to report a refused transfer as a success (see "Quick Share send reported a refused transfer as a success" above); that is fixed and the checks cover it, but it has not been re-run against the phone either.
+2. **The inbound Quick Share failure was fixed but not re-tested against the phone.** The advertisement named two addresses and the peer gave up (see "Quick Share advertisement" above). The fix landed, but the end-to-end confirmation — a file arriving from the OnePlus 13 — has not been re-run since. That is the next thing to do.
+3. **MTA sending needs a one-time Linux helper install.** Android receivers only join a real Wi-Fi Direct group owner, and wpa_supplicant's D-Bus API is root-only. The privileged operations now live in `satella-mta-helper` plus a packaged polkit action, so the CLI stays unprivileged and keeps `~/.config/satella/mta-identity`. Without that install, MTA send still needs the whole CLI under `sudo`/`pkexec`, or it falls back to the Satella-only NetworkManager hotspot. Distro packaging for the helper/policy files is still manual.
+4. **mDNS/LocalSend error spam while `wlan0` is a GO.** Sockets still point at the previous address and log “Network is unreachable”. Cosmetic; suppress or rebind while the GO is up.
+5. **NetworkManager keeps a stale `p2p-dev-wlan0` device.** The kernel interface is gone after the group is destroyed, but NM still lists the P2P device object. It does not block the Wi-Fi restore, which is re-activated explicitly. Cosmetic.
+6. **Windows MTA** needs a WinRT BLE implementation, not vendored. LocalSend and Quick Share paths work there.
+7. **Android specifics** — BLE permissions and a foreground service for background transfers — belong to the frontend shell, not the library. No platform-specific code exists in the core, by design.
+8. **One global Tokio runtime** at the UniFFI boundary (noted with a `ponytail:` comment): all adapters share one worker pool, so a busy protocol could starve another. Acceptable until Android background-transfer load proves otherwise; then per-adapter executors.
+9. **The daemon cannot be told anything while it runs.** `status` reads a state file, it does not talk to the process: there is no way to send a file, change the download directory or ask for a rescan from another process. There is no control socket and no `systemd` unit. The daemon also does not restart itself after a crash; `start` refuses while a pid file names a live process, and a dead one is simply overwritten.
+10. **The daemon's log is not rotated.** `~/.cache/satella-cli/satella-cli.log` grows until the user removes it.
+11. **The MTA refusal path has not been exercised against real hardware.** The vendor's callback is async and the answer channel works, but the only MTA receiver seen so far is a phone that sends, not one that is refused. The refusal needs a sender that waits long enough to be told "no".
+12. **The MTA teardown does not survive a crash.** The credentials needed to tear a Wi-Fi Direct group down live only in the sending process's memory, so a process that dies leaves the group owner address on the interface and `dnsmasq` running. That is what produced the two-address advertisement above. The fix is to keep the record on disk; it has not been written yet.
 
 ---
 

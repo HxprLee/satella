@@ -699,6 +699,29 @@ impl InboundRequest {
                 trace!("Sending keepalive");
                 self.send_keepalive(true).await?;
             }
+            location_nearby_connections::v1_frame::FrameType::Disconnection => {
+                // The peer is closing the session. It sends this frame once it
+                // got everything it wanted, or once it gave up. The session
+                // is over, so a transfer that was still waiting for a decision
+                // is gone with it.
+                //
+                // A transfer that already completed stays completed: the peer
+                // hanging up after the last byte does not undo it.
+                if self.state.state != State::Finished {
+                    info!("The peer disconnected before the transfer was over");
+                    self.update_state(
+                        |e: &mut InnerState| {
+                            e.state = State::Disconnected;
+                        },
+                        true,
+                    )
+                    .await;
+                } else {
+                    info!("The peer disconnected");
+                }
+
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
+            }
             _ => {
                 error!("Unhandled offline frame encrypted: {:?}", offline);
             }
